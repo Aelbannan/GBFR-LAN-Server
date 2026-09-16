@@ -12,6 +12,11 @@ pub struct LanCfg {
     /// Party UDP bind. 0 = ephemeral.
     #[allow(dead_code)]
     pub udp_port: u16,
+    /// Verbose diagnostics: per-message Party traffic, payload hex samples, quest/queue probes,
+    /// per-request broker logging. Off by default (`[debug] enabled = true` in lan.ini or
+    /// `GBFR_LAN_DEBUG=1`); lifecycle, error and rollup lines are always on.
+    #[allow(dead_code)]
+    pub debug: bool,
 }
 
 impl LanCfg {
@@ -42,6 +47,7 @@ fn load_lan_cfg() -> LanCfg {
     let mut ws_port = 8081u16;
     let mut advertise_ip = None;
     let mut udp_port = 0u16;
+    let mut debug = false;
     if let Some(text) = read_lan_ini() {
         let mut section = String::new();
         for line in text.lines() {
@@ -68,8 +74,17 @@ fn load_lan_cfg() -> LanCfg {
                     }
                 }
                 ("party", "udp_port") => udp_port = v.parse().unwrap_or(udp_port),
+                // `[debug] enabled = true` or a bare `debug = true` in any section.
+                ("debug", "enabled") | (_, "debug") => {
+                    debug = parse_bool(v).unwrap_or(debug)
+                }
                 _ => {}
             }
+        }
+    }
+    if let Ok(raw) = std::env::var("GBFR_LAN_DEBUG") {
+        if let Some(b) = parse_bool(&raw) {
+            debug = b;
         }
     }
     if let Ok(raw) = std::env::var("GBFR_LAN_STUB") {
@@ -91,7 +106,24 @@ fn load_lan_cfg() -> LanCfg {
         ws_port,
         advertise_ip,
         udp_port,
+        debug,
     }
+}
+
+/// Ini/env boolean: 1/true/yes/on or 0/false/no/off.
+pub fn parse_bool(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Cached verbose-logging flag (the config itself is loaded once at first use).
+#[allow(dead_code)]
+pub fn debug_enabled() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| lan_cfg().debug)
 }
 
 fn read_lan_ini() -> Option<String> {

@@ -1078,6 +1078,9 @@ fn run_outage_mode() {
 }
 
 fn main() {
+    // Debug mode keeps the fast heartbeat/msg_stats cadences and enables the verbose tiers;
+    // set it before the DLL is loaded so the shim's cached config sees it.
+    std::env::set_var("GBFR_LAN_DEBUG", "1");
     if std::env::args().any(|a| a == "--fallback") {
         std::env::set_var("GBFR_PARTY_FORCE_INLINE", "1");
         run_fallback_mode();

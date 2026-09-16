@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -737,27 +737,96 @@ static LOG_TRUNCATED: AtomicBool = AtomicBool::new(false);
 /// newline as separate writes on a per-line handle, so concurrent request threads interleaved
 /// them (3 merged lines in 20,045 observed) and made automated request counts from this log
 /// unreliable.
-static LOG_LOCK: Mutex<()> = Mutex::new(());
+/// Cached log handle, re-opened periodically: the old code opened and closed the file for
+/// every line, on top of `println!`, while the request thread held a global lock.
+const LOG_REOPEN_MS: u128 = 5000;
+static LOG_FILE: std::sync::OnceLock<Mutex<Option<(std::fs::File, std::time::Instant)>>> =
+    std::sync::OnceLock::new();
 
 fn log_line(msg: &str) {
     let line = format!("[{}] {msg}", ts());
     println!("{line}");
-    let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.create(true);
-            if !LOG_TRUNCATED.swap(true, Ordering::SeqCst) {
-                opts.write(true).truncate(true);
-            } else {
-                opts.append(true);
-            }
-            if let Ok(mut f) = opts.open(dir.join("gbfr-lan-server.log")) {
-                use std::io::Write;
-                // One buffer, one write: the whole line including its terminator.
-                let _ = f.write_all(format!("{line}\n").as_bytes());
-            }
+    let m = LOG_FILE.get_or_init(|| Mutex::new(None));
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    let stale = match g.as_ref() {
+        Some((_, opened)) => opened.elapsed().as_millis() >= LOG_REOPEN_MS,
+        None => true,
+    };
+    if stale {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let Some(dir) = exe.parent() else {
+            return;
+        };
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true);
+        if !LOG_TRUNCATED.swap(true, Ordering::SeqCst) {
+            opts.write(true).truncate(true);
+        } else {
+            opts.append(true);
         }
+        match opts.open(dir.join("gbfr-lan-server.log")) {
+            Ok(f) => *g = Some((f, std::time::Instant::now())),
+            Err(_) => return,
+        }
+    }
+    if let Some((f, _)) = g.as_mut() {
+        use std::io::Write;
+        // One buffer, one write: the whole line including its terminator.
+        if f.write_all(format!("{line}\n").as_bytes()).is_err() {
+            *g = None;
+        }
+    }
+}
+
+/// Per-request logging. `[debug] enabled` logs every request. By default every non-poll request
+/// is logged, but the two hot poll routes (97% of request lines in a measured run) are counted
+/// and summarised once per `REQUEST_ROLLUP_SECS` instead.
+const REQUEST_ROLLUP_SECS: u64 = 30;
+static POLL_PEERS: AtomicU64 = AtomicU64::new(0);
+static POLL_GETLOBBY: AtomicU64 = AtomicU64::new(0);
+static REQUEST_ROLLUP_AT: AtomicU64 = AtomicU64::new(0);
+
+fn log_request(method: &str, host: &str, path: &str) {
+    if lan_cfg::debug_enabled() {
+        log_line(&format!("{method} host={host} path={path}"));
+        return;
+    }
+    let poll = if path == "/party/peers" {
+        1u8
+    } else if path == "/Lobby/GetLobby" {
+        2u8
+    } else {
+        0u8
+    };
+    if poll == 0 {
+        log_line(&format!("{method} host={host} path={path}"));
+        return;
+    }
+    if poll == 1 {
+        POLL_PEERS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        POLL_GETLOBBY.fetch_add(1, Ordering::Relaxed);
+    }
+    let now = now_unix() as u64;
+    let last = REQUEST_ROLLUP_AT.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < REQUEST_ROLLUP_SECS {
+        return;
+    }
+    if REQUEST_ROLLUP_AT
+        .compare_exchange(last, now, Ordering::SeqCst, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let peers = POLL_PEERS.swap(0, Ordering::Relaxed);
+    let lobbies = POLL_GETLOBBY.swap(0, Ordering::Relaxed);
+    if peers + lobbies > 0 {
+        log_line(&format!(
+            "http poll rollup ({}s) party/peers={peers} Lobby/GetLobby={lobbies}",
+            REQUEST_ROLLUP_SECS
+        ));
     }
 }
 
@@ -1361,7 +1430,15 @@ fn handle_playfab(
             .unwrap_or("");
         return Some(match app.lobbies.get(lid) {
             Some(l) => playfab_ok(lobby_public(l)),
-            None => playfab_err("LobbyNotFound", "Lobby not found"),
+            None => {
+                // A miss is the event that precedes every guest's PFLobbyDisconnected; keep it
+                // even though the successful poll lines are rolled up.
+                rate_limited_log(
+                    &format!("getlobby_miss:{lid}"),
+                    &format!("GetLobby miss id={lid}"),
+                );
+                playfab_err("LobbyNotFound", "Lobby not found")
+            }
         });
     }
 
@@ -1578,7 +1655,7 @@ fn dispatch(
         .get("host")
         .cloned()
         .unwrap_or_default();
-    log_line(&format!("{method} host={host} path={stripped}"));
+    log_request(method, &host, &stripped);
 
     // Poison-tolerant locking: a panic anywhere while the state lock is held would otherwise
     // make every later request panic forever (total outage that only a restart clears).
@@ -2021,9 +2098,6 @@ fn load_lobby_ini(path: &str) -> (i64, bool) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut title = TITLE_DEFAULT.to_string();
-    let cfg = lan_cfg::lan_cfg();
-    let mut http_port = cfg.port;
-    let mut ws_port = cfg.ws_port;
     let mut ini = {
         let mut p = std::env::current_exe()
             .ok()
@@ -2036,6 +2110,21 @@ fn main() {
     if let Ok(e) = std::env::var("GBFR_LAN_INI") {
         ini = e;
     }
+    // `--ini` must be visible to the shared config loader (server/party/debug sections),
+    // not only to `load_lobby_ini`, so pre-scan it before the loader is first called.
+    let mut pre = 1;
+    while pre < args.len() {
+        if args[pre] == "--ini" {
+            if let Some(p) = args.get(pre + 1) {
+                ini = p.clone();
+            }
+        }
+        pre += 1;
+    }
+    std::env::set_var("GBFR_LAN_INI", &ini);
+    let cfg = lan_cfg::lan_cfg();
+    let mut http_port = cfg.port;
+    let mut ws_port = cfg.ws_port;
     let mut max_players: Option<i64> = None;
     let mut i = 1;
     while i < args.len() {

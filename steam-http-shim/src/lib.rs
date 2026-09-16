@@ -223,20 +223,48 @@ fn log_file() -> std::path::PathBuf {
 
 static LOG_TRUNCATED: AtomicBool = AtomicBool::new(false);
 
+/// Cached log handle (re-opened periodically) so per-request lines do not pay open/close on
+/// the game thread.
+const LOG_REOPEN_MS: u128 = 5000;
+static LOG_FILE: OnceLock<Mutex<Option<(std::fs::File, std::time::Instant)>>> = OnceLock::new();
+
 fn log_msg(msg: &str) {
     let line = format!("[gbfr-http] {}\n", msg);
     let c = line.replace('\0', "");
     unsafe { OutputDebugStringA(c.as_ptr()) };
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true);
-    if !LOG_TRUNCATED.swap(true, Ordering::SeqCst) {
-        opts.write(true).truncate(true);
-    } else {
-        opts.append(true);
+    let m = LOG_FILE.get_or_init(|| Mutex::new(None));
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    let stale = match g.as_ref() {
+        Some((_, opened)) => opened.elapsed().as_millis() >= LOG_REOPEN_MS,
+        None => true,
+    };
+    if stale {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true);
+        if !LOG_TRUNCATED.swap(true, Ordering::SeqCst) {
+            opts.write(true).truncate(true);
+        } else {
+            opts.append(true);
+        }
+        match opts.open(log_file()) {
+            Ok(f) => *g = Some((f, std::time::Instant::now())),
+            Err(_) => return,
+        }
     }
-    if let Ok(mut f) = opts.open(log_file()) {
+    if let Some((f, _)) = g.as_mut() {
         use std::io::Write;
-        let _ = write!(f, "{}", line);
+        if write!(f, "{}", line).is_err() {
+            *g = None;
+        }
+    }
+}
+
+/// Verbose-only line: per-request HTTP/Steam traffic traces. Off unless lan.ini `[debug]`
+/// or `GBFR_LAN_DEBUG=1`; hooks, lifecycle and failures keep using `log_msg`.
+#[inline]
+fn debug_log(msg: &str) {
+    if debug_enabled() {
+        log_msg(msg);
     }
 }
 
@@ -624,7 +652,7 @@ fn winhttp_execute(req: &mut Request) {
         }
         req.response = body;
         req.ok = (200..300).contains(&status);
-        log_msg(&format!(
+        debug_log(&format!(
             "{} {} -> {} ({} bytes)",
             if req.method == 3 { "POST" } else { "GET" },
             req.url,
@@ -657,7 +685,7 @@ unsafe extern "system" fn create_http(_this: *mut c_void, method: i32, url: *con
             ok: false,
         },
     );
-    log_msg(&format!("CreateHTTPRequest {} {}", id, url));
+    debug_log(&format!("CreateHTTPRequest {} {}", id, url));
     id
 }
 
@@ -781,7 +809,7 @@ unsafe extern "system" fn body_size(_this: *mut c_void, handle: u32, size: *mut 
         if !size.is_null() {
             *size = r.response.len() as u32;
         }
-        log_msg(&format!("GetHTTPResponseBodySize {} {}", handle, r.response.len()));
+        debug_log(&format!("GetHTTPResponseBodySize {} {}", handle, r.response.len()));
         1
     } else {
         0
@@ -795,7 +823,7 @@ unsafe extern "system" fn body_data(_this: *mut c_void, handle: u32, buf: *mut u
             return 0;
         }
         ptr::copy_nonoverlapping(r.response.as_ptr(), buf, r.response.len());
-        log_msg(&format!("GetHTTPResponseBodyData {} {} bytes", handle, r.response.len()));
+        debug_log(&format!("GetHTTPResponseBodyData {} {} bytes", handle, r.response.len()));
         1
     } else {
         0
@@ -929,7 +957,7 @@ unsafe extern "system" fn utils_get_result(
     let packed = pack_http_completed(handle, context, ok, status, body_len);
     let n = std::cmp::min(cub as usize, packed.len());
     ptr::copy_nonoverlapping(packed.as_ptr(), callback, n);
-    log_msg(&format!(
+    debug_log(&format!(
         "GetAPICallResult call={} handle={} status={} bytes={} cub={}",
         call, handle, status, body_len, cub
     ));
@@ -1006,7 +1034,7 @@ fn dispatch_http_callresults() {
                 std::mem::transmute(*slots.add(1));
             let mut buf = packed;
             run(obj, buf.as_mut_ptr(), failed, call);
-            log_msg(&format!("dispatched HTTPRequestCompleted_t call={:#x}", call));
+            debug_log(&format!("dispatched HTTPRequestCompleted_t call={:#x}", call));
         }
     }
 }
@@ -1157,7 +1185,7 @@ unsafe extern "system" fn hook_wh_connect(
         80 | 443 => cfg.port,
         p => p,
     };
-    log_msg(&format!(
+    debug_log(&format!(
         "WinHttpConnect {host_s}:{port} -> {dest_host}:{dest_port}"
     ));
     let wh = to_wide(&dest_host);
@@ -1182,7 +1210,7 @@ unsafe extern "system" fn hook_wh_open_request(
     // GET is sent in the clear.
     let flags2 = flags & !WINHTTP_FLAG_SECURE;
     if flags2 != flags {
-        log_msg(&format!(
+        debug_log(&format!(
             "WinHttpOpenRequest strip SECURE {:#x} {} {}",
             flags,
             from_wide(verb),
@@ -1509,7 +1537,7 @@ fn patch_thread() {
                     let f: unsafe extern "system" fn() -> i32 = std::mem::transmute(huser_fn);
                     f()
                 };
-                log_msg(&format!(
+                debug_log(&format!(
                     "waiting for SteamAPI_Init (steam={:p} huser={})",
                     steam, user
                 ));

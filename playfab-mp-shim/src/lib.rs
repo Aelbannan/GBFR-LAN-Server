@@ -75,17 +75,36 @@ fn log_throttled(key: &str, msg: &str) {
     }
 }
 
+/// Cached log handle, re-opened periodically (same scheme as the Party shim): the per-line
+/// open/write/close this used to do was a syscall storm on the game's tick thread.
+const LOG_REOPEN_MS: u128 = 5000;
+static LOG_FILE: OnceLock<Mutex<Option<(std::fs::File, Instant)>>> = OnceLock::new();
+
 fn log_line(msg: &str) {
     let line = format!("[{}] {msg}\n", now_secs());
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true);
-    if !LOG_TRUNCATED.swap(true, Ordering::SeqCst) {
-        opts.write(true).truncate(true);
-    } else {
-        opts.append(true);
+    let m = LOG_FILE.get_or_init(|| Mutex::new(None));
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    let stale = match g.as_ref() {
+        Some((_, opened)) => opened.elapsed().as_millis() >= LOG_REOPEN_MS,
+        None => true,
+    };
+    if stale {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true);
+        if !LOG_TRUNCATED.swap(true, Ordering::SeqCst) {
+            opts.write(true).truncate(true);
+        } else {
+            opts.append(true);
+        }
+        match opts.open(log_path()) {
+            Ok(f) => *g = Some((f, Instant::now())),
+            Err(_) => return,
+        }
     }
-    if let Ok(mut f) = opts.open(log_path()) {
-        let _ = f.write_all(line.as_bytes());
+    if let Some((f, _)) = g.as_mut() {
+        if f.write_all(line.as_bytes()).is_err() {
+            *g = None;
+        }
     }
 }
 
@@ -117,11 +136,11 @@ fn now_secs() -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Heartbeat cadence and probe-thread tick.
-const PFQUEUE_HEARTBEAT_MS: u64 = 2_000;
+const PFQUEUE_HEARTBEAT_MS: u64 = 30_000;
 const PFQUEUE_TICK_MS: u64 = 500;
 /// CHANGE 1b: per-site state-line heartbeat. A tuple that never changes is restated at most this
-/// often, so a stuck Start/Finish state cannot hide even between the ~2 s thread heartbeats.
-const PFQUEUE_STATE_HEARTBEAT_MS: u64 = 5_000;
+/// often, so a stuck Start/Finish state cannot hide even between the 30 s thread heartbeats.
+const PFQUEUE_STATE_HEARTBEAT_MS: u64 = 30_000;
 
 /// Published queue snapshot. Written under the handle lock, read by the heartbeat thread without
 /// it (so the probe can never block or be blocked by the game's tick thread).
@@ -2516,7 +2535,9 @@ pub unsafe extern "C" fn PFMultiplayerStartProcessingLobbyStateChanges(
             let mode = m
                 .start_state
                 .due((*count as usize, pending, inflight, m.batch_outstanding));
-            if mode != 0 {
+            // Verbose trace: per-change detail is debug-only; the 30 s state heartbeat keeps a
+            // stuck tuple visible by default (and `pfqueue hb` carries the cumulative counters).
+            if mode != 0 && debug_enabled() {
                 log_line(&format!(
                     "pfqueue start n={} pending={pending} inflight={inflight} outstanding={}{}",
                     *count,
@@ -2562,7 +2583,7 @@ pub unsafe extern "C" fn PFMultiplayerFinishProcessingLobbyStateChanges(
                     // between the ~5 s heartbeats.
                     let pending = m.pending.len();
                     let mode = m.finish_state.due((0, pending, 0, false));
-                    if mode != 0 {
+                    if mode != 0 && debug_enabled() {
                         log_line(&format!(
                             "pfqueue finish count=0 reclaimed=0 pending={pending} inflight=0 outstanding=0{}",
                             if mode == 1 { " changed=1" } else { " hb=1" }
@@ -2591,7 +2612,7 @@ pub unsafe extern "C" fn PFMultiplayerFinishProcessingLobbyStateChanges(
                 // CHANGE 1b: reclaimed>0 is a tuple change, so a real reclaim always logs.
                 let pending = m.pending.len();
                 let mode = m.finish_state.due((n, pending, 0, false));
-                if mode != 0 {
+                if mode != 0 && debug_enabled() {
                     log_line(&format!(
                         "pfqueue finish reclaimed={n} pending={pending} inflight=0 outstanding=0{}",
                         if mode == 1 { " changed=1" } else { " hb=1" }

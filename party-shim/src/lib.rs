@@ -37,8 +37,20 @@ const KIND_ACK: u8 = 3;
 /// the outbox condvar, so this only bounds how quickly unsolicited inbound datagrams are noticed
 /// and how often idle timers are re-evaluated. Deliberately a few milliseconds, never a frame.
 const TRANSPORT_POLL_MS: u64 = 2;
-/// Liveness line cadence (log only; the thread never waits this long).
-const TRANSPORT_HEARTBEAT_MS: u64 = 5000;
+/// Liveness line cadence (log only; the thread never waits this long). Kept slow because it is
+/// a rollup; the transport counters also ride `msg_stats`. Debug mode restores the old 5 s
+/// cadence for the integration tests and live diagnosis.
+const TRANSPORT_HEARTBEAT_MS: u64 = 30_000;
+const DEBUG_HEARTBEAT_MS: u64 = 5_000;
+
+#[inline]
+fn heartbeat_ms() -> u64 {
+    if debug_enabled() {
+        DEBUG_HEARTBEAT_MS
+    } else {
+        TRANSPORT_HEARTBEAT_MS
+    }
+}
 /// Sends processed per transport cycle. The outbox is unbounded, so a producer burst must not
 /// hold the global handle mutex for the whole backlog; the next cycle runs immediately while
 /// jobs remain queued.
@@ -184,6 +196,16 @@ fn log_line(msg: &str) {
             // The file may have been deleted or replaced: re-open on the next line.
             *g = None;
         }
+    }
+}
+
+/// Verbose-only line: per-message traffic, probes, hex samples, per-batch ledger traces.
+/// Off unless lan.ini `[debug] enabled = true` or `GBFR_LAN_DEBUG=1`; lifecycle, warning and
+/// rollup lines keep using `log_line` directly.
+#[inline]
+fn debug_log(msg: &str) {
+    if debug_enabled() {
+        log_line(msg);
     }
 }
 
@@ -503,13 +525,22 @@ fn note_eventbus() {
 /// Delivery-ledger heartbeat (CHANGE A / backlog D1). Same shape as `probe_tick_due`: the due
 /// test runs before any string is built or list is walked
 /// and skipped ticks are counted (the `hb_skipped=` term in the ledger line).
-const LEDGER_HEARTBEAT_MS: u64 = 5000;
+const LEDGER_HEARTBEAT_MS: u64 = 30_000;
+
+#[inline]
+fn ledger_heartbeat_ms() -> u64 {
+    if debug_enabled() {
+        DEBUG_HEARTBEAT_MS
+    } else {
+        LEDGER_HEARTBEAT_MS
+    }
+}
 static LEDGER_HB_MS: AtomicU64 = AtomicU64::new(0);
 static LEDGER_HB_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
 fn ledger_hb_due(now_ms: u64) -> bool {
     let last = LEDGER_HB_MS.load(Ordering::Relaxed);
-    if last != 0 && now_ms.wrapping_sub(last) < LEDGER_HEARTBEAT_MS {
+    if last != 0 && now_ms.wrapping_sub(last) < ledger_heartbeat_ms() {
         LEDGER_HB_SKIPPED.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -671,8 +702,15 @@ fn bump_msg_stats(dir: &str, opcode: u32) {
         g.1 += 1;
         *g.3.entry(opcode).or_insert(0) += 1;
     }
+    // Rollup only: the per-message lines are debug-gated, so this is the default record of
+    // what crossed the wire. Fixed 30 s cadence by default; debug mode keeps the old
+    // 5 s-or-every-50-messages behaviour the integration tests and live diagnosis rely on.
     let n = g.0 + g.1;
-    let due = g.4.elapsed() >= Duration::from_secs(5) || n % 50 == 0;
+    let due = if debug_enabled() {
+        g.4.elapsed() >= Duration::from_secs(5) || n % 50 == 0
+    } else {
+        g.4.elapsed() >= Duration::from_secs(30)
+    };
     if !due {
         return;
     }
@@ -719,6 +757,13 @@ fn log_payload(dir: &str, extra: &str, payload: &[u8]) {
             SUB7_RECV.store(true, Ordering::SeqCst);
         }
     }
+    // msg_stats carries the default per-opcode picture (30 s rollup); the per-message trace
+    // and the hex samples are verbose tiers behind `[debug]`. `GBFR_PARTY_LOG_HEX=1` keeps
+    // working standalone: it implies the traffic tier and forces every payload's hex.
+    bump_msg_stats(dir, op);
+    if !debug_enabled() && !log_hex_all() {
+        return;
+    }
     // Surface the sub-opcode on the unconditional line for sends op=2/3, using the
     // same +4 u32le parse as the sampled `{dir}_hex` hints (payload_hints).
     let sub_tag = if dir == "send" && matches!(op, 2 | 3) {
@@ -732,7 +777,6 @@ fn log_payload(dir: &str, extra: &str, payload: &[u8]) {
         "{dir} opcode={op} len={}{sub_tag} {extra}",
         payload.len()
     ));
-    bump_msg_stats(dir, op);
     let key = format!("{dir}:{op}:{sub}:{}", payload.len());
     if !should_log_payload(&key) {
         return;
@@ -2251,7 +2295,8 @@ fn reliable_service(h: &mut Handle, now: u64) {
                     continue;
                 }
                 rel_bump(reliable::mode_index(r.options), |c| c.retransmitted += 1);
-                if r.first {
+                if r.first && debug_enabled() {
+                    // Per-seq detail; the retransmit totals stay on the msg_stats rollup.
                     log_throttled(
                         "first_retx",
                         &format!(
@@ -2575,7 +2620,7 @@ fn next_transport_wait_ms(h: &Handle, now: u64) -> u64 {
 /// game traffic at all. The due test runs before the string is built.
 fn transport_heartbeat(now: u64) {
     let last = XPORT_HB_MS.load(Ordering::Relaxed);
-    if last != 0 && now.wrapping_sub(last) < TRANSPORT_HEARTBEAT_MS {
+    if last != 0 && now.wrapping_sub(last) < heartbeat_ms() {
         return;
     }
     XPORT_HB_MS.store(now, Ordering::Relaxed);
@@ -4611,6 +4656,9 @@ static SOLO_PASSES: AtomicU64 = AtomicU64::new(0);
 static SOLO_EMITTED: AtomicU64 = AtomicU64::new(0);
 
 fn ensure_sampler_thread() {
+    if !debug_enabled() {
+        return;
+    }
     SOLO_STARTED.get_or_init(|| {
         if let Err(e) = std::thread::Builder::new()
             .name("party-solo-sample".into())
@@ -5099,7 +5147,7 @@ pub unsafe extern "C" fn PartyStartProcessingStateChanges(
         let (party, invitation) = connect_gate_party_invitation();
         if invitation != 0 {
             // [deleted] the exe mesh-start hack used to be called here; removed because the shim must not drive game internals.
-        } else {
+        } else if debug_enabled() {
             log_throttled_lazy("mesh_arm_wait", |_| {
                 format!(
                     "mesh-start armed but party+0x218 is still 0 (party={party:#x}): waiting for the exe invitation copy (PTY-8); not firing from Deserialize"
@@ -5169,7 +5217,7 @@ pub unsafe extern "C" fn PartyStartProcessingStateChanges(
             // format! and member/ready list walks. Now at most one pass per PROBE_PASS_MS; skipped
             // ticks allocate nothing and walk nothing, while the per-key log_throttled cadence
             // (1s) and the exact log content are unchanged.
-            if probe_tick_due(now) {
+            if debug_enabled() && probe_tick_due(now) {
                 // Unconditional: the guest never holds a network, so gating on that hid the exact
                 // side we needed. probe_session throttles itself (on change, or every 10 s).
                 probe_session();
@@ -5414,12 +5462,12 @@ pub unsafe extern "C" fn PartyFinishProcessingStateChanges(
             if !payload.is_null() && len >= 8 && readable(payload as usize, 8) {
                 let op = ptr::read_unaligned(payload as *const u32);
                 let sub = ptr::read_unaligned(payload.add(4) as *const u32);
-                log_line(&format!("type21 finished opcode={op} sub={sub} len={len}"));
                 if op == 3 && sub == 7 {
                     SUB7_APPLIED.store(true, Ordering::SeqCst);
                 }
+                debug_log(&format!("type21 finished opcode={op} sub={sub} len={len}"));
             } else {
-                log_line("type21 finished");
+                debug_log("type21 finished");
             }
         }
     }
@@ -5449,13 +5497,15 @@ pub unsafe extern "C" fn PartyFinishProcessingStateChanges(
                 // Rate-limited: a type-21 burst can finish several batches per second, and the
                 // number reclaimed is already carried by `last_reclaimed` in the heartbeat.
                 let hr: &Handle = h;
-                log_throttled_lazy("ledger_finish", |_| {
-                    format!(
-                        "delivery ledger[finish] reclaimed={reclaimed} in_flight_before={in_flight_before} back=[{}] pending={}",
-                        fmt_type_counts(&back),
-                        hr.pending.len()
-                    )
-                });
+                if debug_enabled() {
+                    log_throttled_lazy("ledger_finish", |_| {
+                        format!(
+                            "delivery ledger[finish] reclaimed={reclaimed} in_flight_before={in_flight_before} back=[{}] pending={}",
+                            fmt_type_counts(&back),
+                            hr.pending.len()
+                        )
+                    });
+                }
             }
         },
         (),
