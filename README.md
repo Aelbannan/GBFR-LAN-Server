@@ -1,5 +1,11 @@
 # GBFR LAN
 
+> **For learning only.** This is an unofficial, educational project that studies the
+> game's online services by replacing them with local equivalents — same spirit as other
+> server emulators. It is not affiliated with or endorsed by Cygames, bundles no game
+> assets, and requires your own legally obtained copy of the game. Use it offline or on
+> your own LAN only, never against live services. Provided "as-is", without warranty.
+
 LAN / offline co-op for **Granblue Fantasy: Relink**. This replaces the game's online
 services — Cygames HTTP/WebSocket, PlayFab lobbies, and PlayFab Party — with local
 implementations, so you can host and join quests over your own network or entirely offline
@@ -12,6 +18,13 @@ on one PC.
 
 > Requires your own copy of the game, a Steam emulator (Goldberg) that can load extra
 > DLLs, and a Rust toolchain to build. No game files are included.
+
+## Documentation
+
+Maintainer reference in [`docs/`](docs/): architecture and broker endpoints
+(`docs/architecture.md`), the Party transport and reliability layer
+(`docs/party-transport.md`), the game-side contract and reverse-engineering notes
+(`docs/game-integration.md`), and the genuine-SDK fidelity notes (`docs/sdk-fidelity.md`).
 
 ## Components
 

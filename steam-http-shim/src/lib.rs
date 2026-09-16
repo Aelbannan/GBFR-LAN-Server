@@ -331,6 +331,10 @@ fn mov_eax_imm(code: &[u8]) -> Option<u32> {
     None
 }
 
+/// # Safety
+/// `obj` must be a live Steam callback object: its first field is a vtable pointer and slots
+/// 0..6 are readable function pointers. Objects come from the emulator's RegisterCallback and
+/// are never owned or freed here.
 unsafe fn callback_run_index(obj: usize, default: usize) -> usize {
     let vptr = *(obj as *mut *mut c_void);
     if vptr.is_null() {
@@ -359,6 +363,10 @@ unsafe fn callback_run_index(obj: usize, default: usize) -> usize {
     default
 }
 
+/// # Safety
+/// Same contract as `callback_run_index`, plus: the selected vtable slot is a valid
+/// `void (*)(void*, void*)` and `data` points to a buffer with the callback's documented
+/// layout. Callers pass Steam-owned callback structs and freshly packed payloads.
 unsafe fn invoke_callback(obj: usize, data: *mut u8, default_run: usize) {
     if obj == 0 {
         return;
@@ -463,6 +471,10 @@ fn dispatch_steam_user_callbacks() {
     }
 }
 
+/// # Safety
+/// `vtable` points at a live vtable whose `index`-th slot exists, and `new_fn` has the same ABI
+/// as the function stored there. VirtualProtect is required because vtables sit in read-only
+/// pages after the loader maps them; the original protection is restored before returning.
 unsafe fn patch_slot(vtable: *mut *mut c_void, index: usize, new_fn: *mut c_void) {
     let slot = vtable.add(index);
     let mut old = 0u32;
@@ -472,6 +484,9 @@ unsafe fn patch_slot(vtable: *mut *mut c_void, index: usize, new_fn: *mut c_void
 }
 
 fn winhttp_execute(req: &mut Request) {
+    // SAFETY: every handle below is created by the matching WinHttpOpen* call and closed on all
+    // exit paths; pointers passed to WinHTTP come from NUL-terminated `to_wide` buffers that
+    // outlive each call. No game memory is touched in this function.
     unsafe {
         let agent = to_wide("GBFR-lan-stub");
         let session = WinHttpOpen(agent.as_ptr(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, ptr::null(), ptr::null(), 0);
@@ -984,6 +999,9 @@ fn dispatch_http_callresults() {
                 continue;
             }
             let slots = vptr as *mut *mut c_void;
+            // SAFETY: `cb` is a CCallResult the game registered with RegisterCallResult; vtable
+            // slot 1 is CCallResult::Run (this, void* result, u8 io_failed, u64 apicall). `packed`
+            // is built to the layout the game's HTTPRequestCompleted_t handler reads.
             let run: unsafe extern "system" fn(*mut c_void, *mut u8, u8, u64) =
                 std::mem::transmute(*slots.add(1));
             let mut buf = packed;
@@ -993,6 +1011,10 @@ fn dispatch_http_callresults() {
     }
 }
 
+/// # Safety
+/// `module` must be the base of a live, loaded PE image (or null); its headers and import
+/// tables stay mapped for the process lifetime. `new` must be an `extern "system"` function
+/// whose ABI matches `func`.
 unsafe fn iat_replace(module: *mut u8, dll: &str, func: &str, new: usize) -> Option<usize> {
     if module.is_null() {
         return None;
@@ -1074,6 +1096,8 @@ unsafe extern "C" fn hook_svc_cfg(
 }
 
 fn hook_playfab_iat() {
+    // SAFETY: `exe` is this process's main module (always a valid image base), and the
+    // replacement has the exact signature of PFServiceConfigCreateHandle.
     unsafe {
         let exe = GetModuleHandleA(ptr::null()) as *mut u8;
         if ORIG_SVC_CFG.get().is_some() {
@@ -1109,6 +1133,9 @@ fn from_wide(p: *const u16) -> String {
     }
 }
 
+/// Hook replacement for winhttp!WinHttpConnect. `session` and `host` belong to the caller;
+/// `host` is a NUL-terminated UTF-16 string that is only read (length-capped) here. The other
+/// arguments pass through unchanged to the original WinHttpConnect.
 unsafe extern "system" fn hook_wh_connect(
     session: *mut c_void,
     host: *const u16,
@@ -1198,6 +1225,8 @@ unsafe extern "system" fn hook_wh_send(
 }
 
 fn hook_winhttp_modules() {
+    // SAFETY: modules are resolved by name from the loader; iat_replace validates each import
+    // descriptor before writing, and every replacement has the WinHTTP ABI.
     unsafe {
         let w = GetModuleHandleA(b"winhttp.dll\0".as_ptr());
         if w.is_null() {
@@ -1270,6 +1299,8 @@ fn hook_steam_iat() {
     if IAT_HOOKED.swap(true, Ordering::SeqCst) {
         return;
     }
+    // SAFETY: the patched IAT slots belong to this process's own image, and each replacement
+    // has the exact Steamworks ABI of the function it replaces.
     unsafe {
         let exe = GetModuleHandleA(ptr::null()) as *mut u8;
         if let Some(old) = iat_replace(
@@ -1324,7 +1355,12 @@ fn hook_steam_iat() {
     }
 }
 
+/// Build the replacement ISteamHTTP vtable. The page is VirtualAlloc'd EXECUTE_READWRITE and
+/// zeroed, so unimplemented slots stay null (never call them) and nothing must free it: it
+/// lives for the process lifetime.
 fn http_vtable() -> *mut *mut c_void {
+    // SAFETY: VirtualAlloc returns process-lifetime memory; index arithmetic stays inside the
+    // 32 allocated slots.
     unsafe {
         let mem = VirtualAlloc(
             ptr::null_mut(),
@@ -1380,6 +1416,8 @@ fn try_patch() -> bool {
         }
         type FindFn = unsafe extern "system" fn(i32, *const u8) -> *mut c_void;
         type HUserFn = unsafe extern "system" fn() -> i32;
+        // SAFETY: both symbols were resolved from steam_api64.dll; these are their documented
+        // Steamworks signatures.
         let find: FindFn = std::mem::transmute(find);
         let huser: HUserFn = std::mem::transmute(huser_fn);
         let reported = huser();
@@ -1399,6 +1437,9 @@ fn try_patch() -> bool {
             return false;
         }
         let ours = http_vtable();
+        // SAFETY: `http` is a live interface pointer from the emulator's
+        // FindOrCreateUserInterface; the first field of an interface object is its vtable
+        // pointer, which is exactly what is overwritten. The replacement has the Steam ABI.
         *(http as *mut *mut c_void) = ours as *mut c_void;
         let uv = *(utils as *mut *mut c_void) as *mut *mut c_void;
         let is_c = *uv.add(UTILS_IS_CALL_COMPLETED);
@@ -1479,6 +1520,9 @@ fn patch_thread() {
     log_msg("gave up waiting for SteamAPI_Init / ISteamHTTP");
 }
 
+/// # Safety
+/// Loads the real %SystemRoot%\System32\version.dll (never a game-local copy, which would
+/// recurse); the returned module handle must stay loaded for the process lifetime.
 unsafe fn load_sys_version() -> *mut c_void {
     let mut buf = [0u16; 260];
     let n = GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) as usize;
@@ -1490,6 +1534,9 @@ unsafe fn load_sys_version() -> *mut c_void {
 
 static SYS_VERSION: OnceLock<usize> = OnceLock::new();
 
+/// # Safety
+/// `name` must be a NUL-terminated ASCII export name. The handle comes from
+/// `load_sys_version` and remains valid; a failed load yields null, which is rejected here.
 unsafe fn sys_proc(name: &[u8]) -> *mut c_void {
     let h = *SYS_VERSION.get().unwrap_or(&0) as *mut c_void;
     if h.is_null() {

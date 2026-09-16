@@ -601,6 +601,9 @@ fn read_cstr(p: *const c_char) -> String {
     if p.is_null() {
         return String::new();
     }
+    // SAFETY: `p` is null-checked; the scan is capped at 4096 bytes, so a missing terminator
+    // truncates instead of walking forever. Pointers come from game- or SDK-owned strings
+    // (PFEntityKey fields, state-change keys) that outlive the call.
     let mut n = 0usize;
     unsafe {
         while n < 4096 && *p.add(n) != 0 {
@@ -617,6 +620,11 @@ fn intern(s: &str) -> *const c_char {
     p
 }
 
+/// # Safety
+/// Allocates a fresh array of interned C strings. The memory is intentionally leaked: the SDK
+/// contract keeps the change's key arrays valid until PFMultiplayerFinishProcessingLobbyStateChanges,
+/// and there is currently no reclaim path (see TODO.md). Counts are capped at 32, so the
+/// allocation size is bounded by the caller.
 unsafe fn intern_kv_arrays(map: &HashMap<String, String>) -> (u32, *const *const c_char, *const *const c_char) {
     let n = map.len().min(32);
     if n == 0 {
@@ -671,6 +679,10 @@ fn json_escape(s: &str) -> String {
     o
 }
 
+/// # Safety
+/// `src` is a game-owned PFEntityKey (two NUL-terminated char* fields) valid for the call;
+/// null maps to the default LAN identity. Values are copied into interned CStrings, so the
+/// result does not borrow `src`.
 unsafe fn intern_entity(src: *const EntityKey) -> EntityKey {
     if src.is_null() {
         return EntityKey {
@@ -758,6 +770,10 @@ fn member_data_json(entity_id: &str, extra: &HashMap<String, String>) -> String 
     s
 }
 
+/// # Safety
+/// Reads the documented PFLobbyJoinConfiguration layout: u32 count @0, key array @8, value
+/// array @16. The game owns both arrays for the duration of the call; every element is read
+/// through `kv_list`, which validates the pointers before reading.
 unsafe fn join_cfg_kv(join_cfg: *const u8) -> HashMap<String, String> {
     if join_cfg.is_null() {
         return HashMap::new();
@@ -792,6 +808,8 @@ unsafe fn intern_cstr_list(items: &[String]) -> (u32, *const *const c_char) {
 /// updatedMemberPropertyCount at +0x14, const char* const* updatedMemberPropertyKeys at
 /// +0x18; stride 0x20 (exe: `shl rdi, 5` at 0x143B48947). The count sits at +0x14 — the
 /// field the exe gates its GetMemberConnectionStatus call on (0x143B4894B).
+/// The block is allocated from Rust's heap and intentionally leaked until FinishProcessing
+/// (see TODO.md); the stride and field offsets are the exe's, verified above.
 unsafe fn member_update_entries(updates: &[MemberUpdate]) -> (u32, *mut u8) {
     if updates.is_empty() {
         return (0, ptr::null_mut());
@@ -824,6 +842,9 @@ struct Lobby {
     id: CString,
     connection: CString,
     owner: EntityKey,
+    /// False once the service reports no owner (the owner left under migration policy
+    /// None/Manual). PFLobbyGetOwner then answers S_OK + NULL, as the genuine SDK does.
+    has_owner: bool,
     max_players: u32,
     props: HashMap<String, CString>,
     search: HashMap<String, CString>,
@@ -855,6 +876,7 @@ struct Lobby {
 /// refreshing from the broker, then diffed against the current lobby.
 struct LobbySnapshot {
     owner: EntityKey,
+    has_owner: bool,
     max_players: u32,
     access_policy: u32,
     membership_lock: i32,
@@ -1000,6 +1022,9 @@ fn with_mp<R>(f: impl FnOnce(&mut Mp) -> R, default: R) -> R {
     }
 }
 
+/// Allocate one zeroed state-change record from Rust's global heap; the first 4 bytes are the
+/// type tag. The block is intentionally leaked: it is handed to the title and there is
+/// currently no reclaim path (see TODO.md). Size comes from the caller's fixed layout.
 unsafe fn alloc_sc(size: usize, ty: u32) -> *mut u8 {
     let layout = std::alloc::Layout::from_size_align(size.max(8), 8).unwrap();
     let p = std::alloc::alloc_zeroed(layout);
@@ -1167,8 +1192,9 @@ fn lobby_from_json(text: &str) -> Option<Box<Lobby>> {
     let owner_id = json_obj(text, "Owner")
         .get("Id")
         .cloned()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "owner".into());
+        .filter(|s| !s.is_empty());
+    let has_owner = owner_id.is_some();
+    let owner_id = owner_id.unwrap_or_else(|| "owner".into());
     Some(Box::new(Lobby {
         id: CString::new(id).ok()?,
         connection: CString::new(conn).ok()?,
@@ -1176,6 +1202,7 @@ fn lobby_from_json(text: &str) -> Option<Box<Lobby>> {
             id: intern(&owner_id),
             type_: intern("title_player_account"),
         },
+        has_owner,
         max_players: json_max_players(text),
         props,
         search,
@@ -1192,6 +1219,7 @@ fn lobby_from_json(text: &str) -> Option<Box<Lobby>> {
 
 fn post_create(
     max: u32,
+    owner_migration_policy: u32,
     lobby_data: &HashMap<String, String>,
     search: &HashMap<String, String>,
     owner_id: &str,
@@ -1223,7 +1251,7 @@ fn post_create(
     };
     let md = member_data_json(owner_id, member_kv);
     let body = format!(
-        "{{\"MaxPlayers\":{max},\"LobbyData\":{ld},\"SearchData\":{sd}{owner},\"MemberData\":{md}}}"
+        "{{\"MaxPlayers\":{max},\"OwnerMigrationPolicy\":{owner_migration_policy},\"LobbyData\":{ld},\"SearchData\":{sd}{owner},\"MemberData\":{md}}}"
     );
     let (status, text) = http_json_status("POST", "/Lobby/CreateAndJoinLobby", &body)
         .ok_or(E_PF_SERVICE_UNEXPECTED)?;
@@ -1248,6 +1276,7 @@ fn post_create(
             id: intern(if owner_id.is_empty() { "lan-user" } else { owner_id }),
             type_: intern("title_player_account"),
         },
+        has_owner: !owner_id.is_empty(),
         max_players: resolved_max,
         props,
         search: sch,
@@ -1524,6 +1553,7 @@ fn post_join(
                 id: intern("owner"),
                 type_: intern("title_player_account"),
             },
+            has_owner: true,
             max_players: json_max_players(&got),
             props: HashMap::new(),
             search: HashMap::new(),
@@ -1682,6 +1712,7 @@ fn post_update(
 fn snapshot(l: &Lobby) -> LobbySnapshot {
     LobbySnapshot {
         owner: l.owner,
+        has_owner: l.has_owner,
         max_players: l.max_players,
         access_policy: l.access_policy,
         membership_lock: l.membership_lock,
@@ -1710,6 +1741,9 @@ fn changed_keys(before: &HashMap<String, CString>, after: &HashMap<String, CStri
     keys
 }
 
+/// # Safety
+/// Both keys hold game- or shim-owned C strings; `read_cstr` null-checks and caps its scan, so
+/// a damaged pointer cannot fault. Identity is compared by string value, not by address.
 unsafe fn entity_eq(a: &EntityKey, b: &EntityKey) -> bool {
     read_cstr(a.id) == read_cstr(b.id) && read_cstr(a.type_) == read_cstr(b.type_)
 }
@@ -1719,7 +1753,7 @@ unsafe fn entity_eq(a: &EntityKey, b: &EntityKey) -> bool {
 /// caller emits nothing (a spurious change is as bad as a missing one).
 unsafe fn diff_lobby(before: &LobbySnapshot, after: &Lobby) -> LobbyDelta {
     let mut d = LobbyDelta::default();
-    d.owner_updated = !entity_eq(&before.owner, &after.owner);
+    d.owner_updated = before.has_owner != after.has_owner || !entity_eq(&before.owner, &after.owner);
     d.max_players_updated = before.max_players != after.max_players;
     d.access_policy_updated = before.access_policy != after.access_policy;
     d.membership_lock_updated = before.membership_lock != after.membership_lock;
@@ -1787,6 +1821,7 @@ fn refresh_lobby(lobby: &mut Lobby) -> (Vec<String>, bool, LobbyDelta) {
         lobby.search = fresh.search;
         lobby.connection = fresh.connection;
         lobby.owner = fresh.owner;
+        lobby.has_owner = fresh.has_owner;
         lobby.max_players = fresh.max_players;
         lobby.access_policy = fresh.access_policy;
         lobby.membership_lock = fresh.membership_lock;
@@ -1920,6 +1955,13 @@ pub unsafe extern "C" fn PFMultiplayerCreateAndJoinLobby(
     // PFLobbyCreateConfiguration: +0 maxMemberCount, +4 ownerMigrationPolicy,
     // +8 accessPolicy. The broker stores accessPolicy only when its create body carries
     // it; the shim mirrors the create request locally until the first GetLobby refresh.
+    // ownerMigrationPolicy cannot change after create and is what decides owner handling
+    // when the owner leaves, so it is forwarded to the broker with the create body.
+    let owner_migration_policy = if create_cfg.is_null() {
+        0
+    } else {
+        ptr::read_unaligned(create_cfg.add(4) as *const u32).min(3)
+    };
     let access_policy = if create_cfg.is_null() {
         0
     } else {
@@ -1943,13 +1985,14 @@ pub unsafe extern "C" fn PFMultiplayerCreateAndJoinLobby(
     let owner = intern_entity(creator);
     let member_kv = join_cfg_kv(join_cfg);
     log_line(&format!(
-        "CreateAndJoinLobby max={max} lobby_props={} search={} member_props={}",
+        "CreateAndJoinLobby max={max} owner_policy={owner_migration_policy} lobby_props={} search={} member_props={}",
         lobby_data.len(),
         search.len(),
         member_kv.len()
     ));
     let mut lobby = match post_create(
         max,
+        owner_migration_policy,
         &lobby_data,
         &search,
         &read_cstr(owner.id),
@@ -1965,6 +2008,7 @@ pub unsafe extern "C" fn PFMultiplayerCreateAndJoinLobby(
         }
     };
     lobby.owner = owner;
+    lobby.has_owner = true;
     lobby.access_policy = access_policy;
     lobby.members.push(owner);
     let mid = read_cstr(owner.id);
@@ -2746,6 +2790,12 @@ pub unsafe extern "C" fn PFLobbyGetOwner(lobby: *mut c_void, out: *mut *const En
     if l.pending {
         return E_PF_OBJECT_STILL_PENDING;
     }
+    if !l.has_owner {
+        // A service lobby with migration policy None/Manual is ownerless after the owner
+        // leaves; the documented output is S_OK + NULL and the exe null-checks it.
+        *out = ptr::null();
+        return S_OK;
+    }
     *out = &l.owner;
     S_OK
 }
@@ -2875,6 +2925,7 @@ pub unsafe extern "C" fn PFLobbyPostUpdate(
         lobby_deletes = lobby_del;
         if let Some(o) = scalars.owner {
             l.owner = o;
+            l.has_owner = true;
         }
         if let Some(m) = scalars.max_players {
             l.max_players = m;

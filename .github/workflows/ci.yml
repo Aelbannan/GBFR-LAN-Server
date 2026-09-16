@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build shims and server
+        run: .\build.ps1
+
+      - name: Unit tests (lan-server)
+        run: cargo test --manifest-path lan-server\Cargo.toml
+
+      - name: Reliable-delivery tests
+        working-directory: party-shim
+        run: |
+          rustc -O -o reliable_test.exe reliable_test.rs
+          .\reliable_test.exe
+
+      - name: Party broker/transport tests
+        working-directory: party-shim
+        run: |
+          rustc --edition 2021 -O -o broker_http_test.exe broker_http_test.rs
+          .\broker_http_test.exe
+
+      - name: PlayFab lobby smoke test
+        working-directory: playfab-mp-shim
+        run: |
+          rustc tests\postupdate_smoke.rs -o tests\postupdate_smoke.exe
+          $srv = Start-Process -FilePath ..\lan-server\gbfr-lan-server.exe -ArgumentList '--http-port','18080','--ws-port','18081' -PassThru
+          try {
+            Start-Sleep -Seconds 1
+            $env:GBFR_LAN_STUB = '127.0.0.1:18080'
+            .\tests\postupdate_smoke.exe .\PlayFabMultiplayerWin.dll
+            if ($LASTEXITCODE -ne 0) { throw "postupdate_smoke failed ($LASTEXITCODE)" }
+          } finally {
+            Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
+          }

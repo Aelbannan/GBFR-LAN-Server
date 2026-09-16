@@ -430,6 +430,10 @@ fn eventbus_table() -> &'static Mutex<EventBusTable> {
 
 /// One aligned read of the event dword, or `None` when the object or the field is not readable.
 #[inline]
+/// # Safety
+/// Reads the game's global EventBus object: both the global slot and the object it points at
+/// are validated with `readable` before the dereference, and a game update that moves the RVA
+/// degrades to `None` rather than a fault.
 unsafe fn eventbus_dword() -> Option<u32> {
     let base = exe_base();
     if base == 0 || !readable(base + EVENTBUS_OBJ_RVA, 8) {
@@ -801,6 +805,10 @@ fn page_has_read(protect: u32) -> bool {
     matches!(protect & 0xff, 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80)
 }
 
+/// # Safety
+/// `p` may be any value (0, stale, or a live game address); this function performs no
+/// dereference itself. It is the validation gate every raw read must call: the whole
+/// `p..p+n` range has to sit in one committed, readable region.
 unsafe fn readable(p: usize, n: usize) -> bool {
     if p == 0 || n == 0 || p.checked_add(n).is_none() {
         return false;
@@ -1427,6 +1435,10 @@ fn note_type12_hold(h: &mut Handle) -> (bool, bool, u64) {
     (holding, timed_out, oldest_ms)
 }
 
+/// Allocate one zeroed state-change record from Rust's global heap; the first 4 bytes hold the
+/// type tag. The block is intentionally leaked: it is handed to the title in a batch and there
+/// is currently no reclaim path (see TODO.md). Size comes from the caller's fixed offsets, so
+/// the allocation can never be smaller than the writes that follow it.
 unsafe fn alloc_sc(size: usize, ty: u32) -> *mut u8 {
     let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
     let p = std::alloc::alloc_zeroed(layout);
@@ -1760,6 +1772,11 @@ fn poll_peers_apply(h: &mut Handle, net: *mut Network) {
 /// Queue a type-21 EndpointMessageReceived state change for `payload` from
 /// remote `ep`, delivered to the local endpoint of `net`. Layout matches what
 /// the exe's state-change switch reads (see the recv loop for field offsets).
+/// # Safety
+/// Builds a type-21 state change in a fresh zeroed allocation and copies the payload into it.
+/// `h`/`net`/`ep` are live Box-owned objects owned by the global state (hold the handle mutex
+/// while calling); offsets match the exe's handler. The allocation is intentionally leaked
+/// until FinishProcessing (see TODO.md).
 unsafe fn deliver_type21(
     h: &mut Handle,
     net: *mut Network,
@@ -3248,6 +3265,10 @@ unsafe fn emit_connect_completed(h: &mut Handle, netp: *mut Network) {
     ));
 }
 
+/// # Safety
+/// `h` and `desc` come from the exported Party entry points while the global handle mutex is
+/// held. `desc` was deserialized by the caller; the returned Network is Box-owned by the shim
+/// and stays valid until the network is destroyed.
 unsafe fn connect_network(h: &mut Handle, desc: Descriptor) -> *mut Network {
     let ident = desc.id_str();
     if let Some(n) = h
@@ -3644,6 +3665,10 @@ unsafe fn connect_gate_party_invitation() -> (usize, u64) {
     (party, ptr::read_unaligned((party + 0x218) as *const u64))
 }
 
+/// # Safety
+/// `obj` is a game-owned std::string-like object (layout at +0x10 len, +0x18 cap). Capacity,
+/// length, storage pointer and the bytes themselves are each validated with `readable` before
+/// use; any failed check yields an empty string instead of a fault.
 unsafe fn read_std_string(obj: usize) -> String {
     if !readable(obj + 0x18, 8) || !readable(obj + 0x10, 8) {
         return String::new();
@@ -3668,6 +3693,11 @@ unsafe fn read_std_string(obj: usize) -> String {
     String::from_utf8_lossy(sl).into_owned()
 }
 
+/// # Safety
+/// Walks the exe's member-list global (`MEMBER_LIST_GLOBAL_RVA`). Every step is guarded by
+/// `readable` and a shape check (end >= begin, stride 0x20, bounded entry count); an
+/// unrecognised layout returns `None` instead of reading out of bounds. The RVA is
+/// version-specific and must be re-derived after a game update.
 unsafe fn member_list_container() -> Option<usize> {
     let base = GetModuleHandleA(ptr::null()) as usize;
     if base == 0 || !readable(base + MEMBER_LIST_GLOBAL_RVA, 8) {
@@ -4035,6 +4065,10 @@ const ASYNC_VB_SCAN_MAX: usize = 32; // path cap: vector-B entries
 // Read/format helpers shared by the probe lines and the standalone solo sampler. An unreadable
 // read is always `None` (never a sentinel a real value could hide behind); formatting only runs
 // when the caller has already decided to emit.
+/// # Safety
+/// These read arbitrary addresses, but every call re-validates through `readable`, so an
+/// unreadable or stale pointer yields `None` instead of faulting. They are the sanctioned way
+/// to touch game memory in the probe paths.
 #[inline]
 unsafe fn rd32(p: usize) -> Option<u32> {
     if readable(p, 4) {

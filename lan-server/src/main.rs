@@ -45,6 +45,11 @@ struct Lobby {
     id: String,
     connection: String,
     owner: Value,
+    /// PlayFab `PFLobbyOwnerMigrationPolicy` chosen by the title at create (0 = None, the
+    /// value this game sends; 1 = Automatic, 2 = Manual, 3 = Server). It cannot change.
+    /// When the owner leaves, Automatic migrates the owner and None/Manual clears it; the
+    /// lobby itself only dies with its last member (client-owned lobby semantics).
+    owner_migration_policy: i64,
     max_players: i64,
     lobby_data: Map<String, Value>,
     search_data: Map<String, Value>,
@@ -526,6 +531,7 @@ fn lobby_public(lobby: &Lobby) -> Value {
         "LobbyId": lobby.id,
         "ConnectionString": lobby.connection,
         "Owner": lobby.owner,
+        "OwnerMigrationPolicy": lobby.owner_migration_policy,
         "MaxPlayers": lobby.max_players,
         "CurrentPlayers": lobby.members.len(),
         "MembershipLock": lobby.membership_lock,
@@ -626,6 +632,25 @@ fn as_obj_or_empty(v: Option<&Value>) -> Map<String, Value> {
     v.and_then(|x| x.as_object().cloned()).unwrap_or_default()
 }
 
+/// `PFLobbyOwnerMigrationPolicy`: 0 None (the exe's create value), 1 Automatic, 2 Manual,
+/// 3 Server. The shim forwards the exe's dword; string forms are accepted too so a
+/// hand-written body cannot silently pick the wrong policy.
+fn parse_owner_migration_policy(body: &Value) -> i64 {
+    match body
+        .get("OwnerMigrationPolicy")
+        .or_else(|| body.get("ownerMigrationPolicy"))
+    {
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0).clamp(0, 3),
+        Some(Value::String(s)) => match s.to_ascii_lowercase().as_str() {
+            "automatic" => 1,
+            "manual" => 2,
+            "server" => 3,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
 fn create_lobby(app: &mut App, body: &Value, player: &Player) -> String {
     let lobby_id = format!("lan-{}", &sha1_hex(&format!("{}{}", now_unix(), player.entity_id))[..12]);
     let owner = body
@@ -665,6 +690,7 @@ fn create_lobby(app: &mut App, body: &Value, player: &Player) -> String {
         id: lobby_id.clone(),
         connection: format!("lan.{}.{}", app.title_id, lobby_id),
         owner,
+        owner_migration_policy: parse_owner_migration_policy(body),
         max_players: resolve_lobby_max(app, json_i64(body, "MaxPlayers").or_else(|| json_i64(body, "maxPlayers"))),
         lobby_data: as_obj_or_empty(
             body.get("LobbyData")
@@ -1159,22 +1185,47 @@ fn handle_playfab(
             let pid = request_entity_id(app, body, headers);
             let owner = lobby_owner_id(&lobby);
             let owner_left = pid.as_ref().map(|p| p == &owner).unwrap_or(false);
+            let policy = lobby.owner_migration_policy;
             let before = lobby.members.len();
             if let Some(ref pid) = pid {
                 lobby.members.retain(|m| member_id(m) != *pid);
-                if lobby.members.len() == before && before <= 1 {
-                    lobby.members.clear();
-                }
-            } else if before <= 1 {
+            }
+            // An unresolved caller leaving a one-member lobby is that member leaving.
+            if lobby.members.len() == before && before <= 1 {
                 lobby.members.clear();
             }
-            let closed = owner_left || lobby.members.is_empty();
+            let closed = lobby.members.is_empty();
+            let mut owner_note = String::new();
+            if !closed && owner_left {
+                // PlayFab keeps a client-owned lobby alive after its owner leaves
+                // (ownership-changes): Automatic hands it to another member, while
+                // None/Manual clear the owner so a remaining member can claim it.
+                if policy == 1 {
+                    let next = lobby.members[0].clone();
+                    let eid = member_id(&next);
+                    owner_note = format!(" owner->{eid}(Automatic)");
+                    lobby.owner = next
+                        .get("MemberEntity")
+                        .cloned()
+                        .filter(|v| {
+                            json_str(v, "Id")
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or_else(|| {
+                            json!({"Id": eid, "Type": "title_player_account"})
+                        });
+                } else {
+                    owner_note = format!(" owner->none(policy={policy})");
+                    lobby.owner = Value::Null;
+                }
+            }
             let remain = lobby.members.len();
             if !closed {
                 app.lobbies.insert(lid.to_string(), lobby);
             }
             log_line(&format!(
-                "LeaveLobby {lid} members={} closed={closed} owner_left={owner_left}",
+                "LeaveLobby {lid} members={} closed={closed} owner_left={owner_left}{owner_note}",
                 if closed { 0 } else { remain }
             ));
         }
