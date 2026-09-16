@@ -124,9 +124,11 @@ advertise_ip =           ; blank = auto-detect; set this PC's LAN IP if needed
 Same PC / Nucleus instances: keep `127.0.0.1`. The `GBFR_LAN_STUB=host:port` environment
 variable overrides `[server]` for one process.
 
-The default log profile is lifecycle, transitions and errors only. `[debug] enabled = true`
-(or `GBFR_LAN_DEBUG=1` for one process) adds the verbose tiers: per-message Party traffic,
-payload hex samples, quest/queue probes, and one line per broker request.
+The default log profile is errors and warnings only — no periodic output, so a healthy
+session writes nothing. The broker still prints non-poll request activity to its console.
+`[debug] enabled = true` (or `GBFR_LAN_DEBUG=1` for one process) adds the verbose tiers:
+lifecycle/transition lines, per-message Party traffic, payload hex samples, quest/queue
+probes, and one line per broker request.
 
 ## Run
 

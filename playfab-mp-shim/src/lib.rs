@@ -108,6 +108,22 @@ fn log_line(msg: &str) {
     }
 }
 
+/// Verbose-only line. Off unless lan.ini `[debug] enabled = true` or `GBFR_LAN_DEBUG=1`;
+/// `log_line` is reserved for errors and warnings so debug-off runs stay quiet.
+#[inline]
+fn debug_log(msg: &str) {
+    if debug_enabled() {
+        log_line(msg);
+    }
+}
+
+#[inline]
+fn debug_throttled(key: &str, msg: &str) {
+    if debug_enabled() {
+        log_throttled(key, msg);
+    }
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -242,7 +258,7 @@ fn start_queue_heartbeat() {
                 }
                 last_key = key;
                 last_log = Instant::now();
-                log_line(&format!(
+                debug_log(&format!(
                     "pfqueue hb pending={pending} inflight={inflight} outstanding={} starts={} finishes={} batches_nonzero={} queued={} reclaimed={} max_pending={} max_inflight={} latch={} stray={} mismatch={}{}",
                     outstanding as u8,
                     Q_STARTS.load(Ordering::Relaxed),
@@ -1062,7 +1078,7 @@ fn queue(m: &mut Mp, p: *mut u8) {
     // CHANGE 1: every enqueue is visible with its type and the resulting depth, so a change that
     // is never handed out can be named (exactly the guest's JoinLobbyCompleted + 2x MemberAdded).
     let ty = unsafe { ptr::read_unaligned(p as *const u32) };
-    log_line(&format!("pfqueue queue type={ty} pending={}", m.pending.len()));
+    debug_log(&format!("pfqueue queue type={ty} pending={}", m.pending.len()));
     probe_snapshot(m);
 }
 
@@ -1409,7 +1425,7 @@ unsafe fn emit_member_added(m: &mut Mp, lobby: *mut Lobby, member: EntityKey) {
     ptr::write_unaligned(sc2.add(8) as *mut *mut Lobby, lobby);
     ptr::write_unaligned(sc2.add(0x10) as *mut EntityKey, member);
     queue(m, sc2);
-    log_line(&format!("MemberAdded entity={id}"));
+    debug_log(&format!("MemberAdded entity={id}"));
 }
 
 unsafe fn announce_lobby_members(m: &mut Mp, lobby: *mut Lobby) {
@@ -1473,7 +1489,7 @@ unsafe fn emit_updated(m: &mut Mp, lobby: *mut Lobby, mut delta: LobbyDelta, for
             )
         })
         .collect();
-    log_line(&format!(
+    debug_log(&format!(
         "LobbyUpdated type7 id={} owner={} max={} access={} lock={} search=[{}] lobby=[{}] members=[{}]",
         (*lobby).id.to_string_lossy(),
         delta.owner_updated as u8,
@@ -1525,7 +1541,7 @@ unsafe fn emit_join_completed(m: &mut Mp, lobby: *mut Lobby, joiner: EntityKey, 
     ptr::write_unaligned(sc.add(0x20) as *mut *mut Lobby, lobby);
     let _ = async_ctx;
     queue(m, sc);
-    log_line("JoinLobbyCompleted type1 lobby@+0x20");
+    debug_log("JoinLobbyCompleted type1 lobby@+0x20");
 }
 
 fn post_join(
@@ -1845,7 +1861,7 @@ fn refresh_lobby(lobby: &mut Lobby) -> (Vec<String>, bool, LobbyDelta) {
         lobby.access_policy = fresh.access_policy;
         lobby.membership_lock = fresh.membership_lock;
         if fresh.members.is_empty() && !lobby.members.is_empty() {
-            log_line(&format!(
+            debug_log(&format!(
                 "GetLobby Members empty id={}; keep local n={}",
                 lobby.id.to_string_lossy(),
                 lobby.members.len()
@@ -1889,7 +1905,7 @@ pub unsafe extern "C" fn PFMultiplayerInitialize(
         return E_PF_INSTANCE_ALREADY_EXISTS;
     }
     let title = CString::new(read_cstr(title_id)).unwrap_or_else(|_| CString::new("lan").unwrap());
-    log_line(&format!("PFMultiplayerInitialize title={}", title.to_string_lossy()));
+    debug_log(&format!("PFMultiplayerInitialize title={}", title.to_string_lossy()));
     let mut boxed = Box::new(Mp {
         title,
         token: None,
@@ -1940,7 +1956,7 @@ pub unsafe extern "C" fn PFMultiplayerSetEntityToken(
         return E_PF_ENTITY_TOKEN_MALFORMED;
     }
     let tok = read_cstr(token);
-    log_line(&format!("SetEntityToken len={}", tok.len()));
+    debug_log(&format!("SetEntityToken len={}", tok.len()));
     set_local_identity(entity, &tok);
     with_mp(
         |m| {
@@ -2003,7 +2019,7 @@ pub unsafe extern "C" fn PFMultiplayerCreateAndJoinLobby(
     }
     let owner = intern_entity(creator);
     let member_kv = join_cfg_kv(join_cfg);
-    log_line(&format!(
+    debug_log(&format!(
         "CreateAndJoinLobby max={max} owner_policy={owner_migration_policy} lobby_props={} search={} member_props={}",
         lobby_data.len(),
         search.len(),
@@ -2034,11 +2050,11 @@ pub unsafe extern "C" fn PFMultiplayerCreateAndJoinLobby(
     let mut mp = HashMap::new();
     apply_props(&mut mp, member_kv);
     ensure_member_props(&mut mp, &mid);
-    log_line(&format!(
+    debug_log(&format!(
         "CreateAndJoinLobby member_props={} id={mid}",
         mp.len()
     ));
-    log_line(&format!(
+    debug_log(&format!(
         "CreateAndJoinLobby data search_keys=[{}] lobby_keys=[{}]",
         map_preview(&lobby.search, 400),
         map_preview(&lobby.props, 400)
@@ -2059,7 +2075,7 @@ pub unsafe extern "C" fn PFMultiplayerCreateAndJoinLobby(
             .unwrap_or_else(|e| e.into_inner())
             .insert(dump.clone())
         {
-            log_line(&dump);
+            debug_log(&dump);
         }
     }
     lobby.member_props.insert(mid, mp);
@@ -2101,7 +2117,7 @@ pub unsafe extern "C" fn PFMultiplayerJoinLobby(
     let conn = read_cstr(connection);
     let joiner_ek = intern_entity(joiner);
     let member_kv = join_cfg_kv(join_cfg);
-    log_line(&format!(
+    debug_log(&format!(
         "JoinLobby conn={conn} member_props={}",
         member_kv.len()
     ));
@@ -2115,7 +2131,7 @@ pub unsafe extern "C" fn PFMultiplayerJoinLobby(
             return code;
         }
     };
-    log_line(&format!(
+    debug_log(&format!(
         "JoinLobby lobby id={} search_keys=[{}] lobby_keys=[{}]",
         lobby.id.to_string_lossy(),
         map_preview(&lobby.search, 500),
@@ -2139,7 +2155,7 @@ pub unsafe extern "C" fn PFMultiplayerJoinLobby(
             if lobby_ready_for_guest(&*lp) {
                 emit_join_completed(m, lp, joiner_ek, async_ctx);
             } else {
-                log_line("JoinLobby waiting for network_descriptor");
+                debug_log("JoinLobby waiting for network_descriptor");
                 m.pending_joins.push(PendingJoin {
                     lobby: lp,
                     joiner: joiner_ek,
@@ -2239,7 +2255,7 @@ pub unsafe extern "C" fn PFMultiplayerFindLobbies(
         })
         .unwrap_or_else(|| "none".to_string());
     // Log the raw filter once per search so a future mismatch is visible in the log.
-    log_line(&format!(
+    debug_log(&format!(
         "FindLobbies filter=\"{}\" sort=\"{}\" count={} friends={}",
         preview_str(&filter, 600),
         preview_str(&sort, 100),
@@ -2294,7 +2310,7 @@ pub unsafe extern "C" fn PFMultiplayerFindLobbies(
     } else {
         broker_error_code(status, &text)
     };
-    log_line(&format!("FindLobbies n={}", rows.len()));
+    debug_log(&format!("FindLobbies n={}", rows.len()));
     for row in rows.iter().take(4) {
         let sd = json_obj(row, "SearchData");
         let mut keys: Vec<String> = sd
@@ -2302,7 +2318,7 @@ pub unsafe extern "C" fn PFMultiplayerFindLobbies(
             .map(|(k, v)| format!("{k}={}", preview_str(v, 48)))
             .collect();
         keys.sort();
-        log_line(&format!(
+        debug_log(&format!(
             "FindLobbies row {} search=[{}]",
             json_str(row, "LobbyId").unwrap_or_default(),
             preview_str(&keys.join(", "), 500)
@@ -2415,7 +2431,7 @@ pub unsafe extern "C" fn PFMultiplayerStartProcessingLobbyStateChanges(
                         queue(m, sc);
                         // Allow a later re-join to be announced again.
                         (*lp).announced.remove(&eid);
-                        log_line(&format!("MemberRemoved entity={eid}"));
+                        debug_log(&format!("MemberRemoved entity={eid}"));
                     }
                     // PF-03 re-fix: `refresh_lobby` returns gone=true from its early non-200 return,
                     // which carries no delta — so gating this on a change made the emission
@@ -2710,7 +2726,7 @@ pub unsafe extern "C" fn PFLobbyGetLobbyProperty(
                 v
             }
         };
-        log_line(&format!("GetLobbyProperty {k}={shown}"));
+        debug_log(&format!("GetLobbyProperty {k}={shown}"));
     }
     S_OK
 }
@@ -2751,7 +2767,7 @@ pub unsafe extern "C" fn PFLobbyGetSearchProperty(
         guard.insert(k.clone(), shown.clone()) != Some(shown.clone())
     };
     if changed {
-        log_line(&format!("GetSearchProperty {k}={shown}"));
+        debug_log(&format!("GetSearchProperty {k}={shown}"));
     }
     S_OK
 }
@@ -2794,7 +2810,7 @@ pub unsafe extern "C" fn PFLobbyGetMemberProperty(
     if (*out).is_null() {
         log_line(&format!("GetMemberProperty miss member={mid} key={k}"));
     } else if k.starts_with("member_platform") {
-        log_line(&format!(
+        debug_log(&format!(
             "GetMemberProperty member={mid} {k}={}",
             read_cstr(*out)
         ));
@@ -2834,7 +2850,7 @@ pub unsafe extern "C" fn PFLobbyGetMembershipLock(lobby: *mut c_void, out: *mut 
     // The exe only reaches this getter when an Updated set membershipLockUpdated
     // (disassembly 0x143B488B1 -> 0x143B488D0 -> lobby+0xD8 at 0x143B488DC), so this
     // line is the end-to-end proof that the lock-population Updated was consumed.
-    log_line(&format!(
+    debug_log(&format!(
         "GetMembershipLock value={} (reached via Updated membershipLockUpdated)",
         *out
     ));
@@ -2867,7 +2883,7 @@ pub unsafe extern "C" fn PFLobbyGetMemberConnectionStatus(
         return E_PF_LOBBY_MEMBER_NOT_IN_LOBBY;
     }
     *out = 1; // Connected
-    log_throttled(
+    debug_throttled(
         "member_conn_status",
         &format!("GetMemberConnectionStatus member={mid} value=1"),
     );
@@ -2957,7 +2973,7 @@ pub unsafe extern "C" fn PFLobbyPostUpdate(
         if let Some(k) = scalars.membership_lock {
             l.membership_lock = k;
         }
-        log_throttled(
+        debug_throttled(
             "postupdate_search",
             &format!(
                 "PostUpdate search={search_count}(set) del={} lobby={lobby_count}(set) del={}",
@@ -2985,7 +3001,7 @@ pub unsafe extern "C" fn PFLobbyPostUpdate(
                 }
             }
         }
-        log_throttled(
+        debug_throttled(
             "postupdate_keys",
             &format!(
                 "PostUpdate keys search=[{}] lobby=[{}] del_search=[{}] del_lobby=[{}]",
@@ -3018,14 +3034,14 @@ pub unsafe extern "C" fn PFLobbyPostUpdate(
             ensure_member_props(entry, &mid);
             member_target = Some(mid.clone());
             member_deletes = mu_del;
-            log_line(&format!(
+            debug_log(&format!(
                 "PostUpdate MemberData member={mid} keys={} del={}",
                 entry.len(),
                 member_deletes.len()
             ));
         }
     }
-    log_throttled(
+    debug_throttled(
         "postupdate",
         &format!(
         "PostUpdate id={} props={} desc={} inv={}",
@@ -3111,7 +3127,7 @@ pub unsafe extern "C" fn PFLobbyLeave(
             )
         };
         let _ = http_json("POST", "/Lobby/LeaveLobby", &body);
-        log_line(&format!("Leave {id} entity={eid}"));
+        debug_log(&format!("Leave {id} entity={eid}"));
     }
     with_mp(
         |m| {
@@ -3148,7 +3164,7 @@ pub unsafe extern "C" fn PFLobbyForceRemoveMember(
 #[no_mangle]
 pub extern "system" fn DllMain(_m: *mut c_void, reason: u32, _r: *mut c_void) -> i32 {
     if reason == 1 {
-        log_line("PlayFabMultiplayerWin.dll LAN stub loaded");
+        debug_log("PlayFabMultiplayerWin.dll LAN stub loaded");
     }
     1
 }

@@ -200,12 +200,28 @@ fn log_line(msg: &str) {
 }
 
 /// Verbose-only line: per-message traffic, probes, hex samples, per-batch ledger traces.
-/// Off unless lan.ini `[debug] enabled = true` or `GBFR_LAN_DEBUG=1`; lifecycle, warning and
-/// rollup lines keep using `log_line` directly.
+/// Off unless lan.ini `[debug] enabled = true` or `GBFR_LAN_DEBUG=1`. `log_line` is reserved
+/// for errors and warnings; there is no periodic output when debug is off.
 #[inline]
 fn debug_log(msg: &str) {
     if debug_enabled() {
         log_line(msg);
+    }
+}
+
+/// Throttled diagnostics with the same gate as `debug_log`. The message may already be built
+/// by the caller; the lazy variant builds it only when the line will be emitted.
+#[inline]
+fn debug_throttled(key: &str, msg: &str) {
+    if debug_enabled() {
+        log_throttled(key, msg);
+    }
+}
+
+#[inline]
+fn debug_throttled_lazy(key: &str, f: impl FnOnce(u32) -> String) {
+    if debug_enabled() {
+        log_throttled_lazy(key, f);
     }
 }
 
@@ -367,7 +383,7 @@ fn note_party_thread() -> u32 {
         {
             THREAD_COUNTS[i].store(1, Ordering::Relaxed);
             let n = THREAD_DISTINCT.fetch_add(1, Ordering::Relaxed) + 1;
-            log_line(&format!(
+            debug_log(&format!(
                 "party_thread new tid={tid:#010x} distinct={n} calls_total={} — first Party export call on this thread",
                 THREAD_TOTAL_CALLS.load(Ordering::Relaxed)
             ));
@@ -565,7 +581,7 @@ fn log_send_options_once(options: u32) {
     }
     g.push(options);
     let mode = reliable::mode_index(options);
-    log_line(&format!(
+    debug_log(&format!(
         "send options word {options:#010x} decoded: {} (mode={}, {}), first use of this value",
         reliable::decode_options(options),
         reliable::mode_name(mode),
@@ -584,7 +600,7 @@ fn log_big_send_once(len: usize, options: u32) {
     if DONE.swap(true, Ordering::SeqCst) {
         return;
     }
-    log_line(&format!(
+    debug_log(&format!(
         "send payload len={len} > 1400 options={options:#010x}: Party documents fragmentation/reassembly but shim sends one datagram per message"
     ));
 }
@@ -723,7 +739,7 @@ fn bump_msg_stats(dir: &str, opcode: u32) {
             .collect::<Vec<_>>()
             .join(",")
     }
-    log_line(&format!(
+    debug_log(&format!(
         "msg_stats send={} recv={} send_ops={} recv_ops={} {} probes_run={} probes_skipped={}{}{}",
         g.0,
         g.1,
@@ -773,7 +789,7 @@ fn log_payload(dir: &str, extra: &str, payload: &[u8]) {
     } else {
         String::new()
     };
-    log_line(&format!(
+    debug_log(&format!(
         "{dir} opcode={op} len={}{sub_tag} {extra}",
         payload.len()
     ));
@@ -789,7 +805,7 @@ fn log_payload(dir: &str, extra: &str, payload: &[u8]) {
     } else {
         String::new()
     };
-    log_line(&format!(
+    debug_log(&format!(
         "{dir}_hex opcode={op} len={} {} {}{} hex=[{}]",
         payload.len(),
         extra,
@@ -816,14 +832,14 @@ fn opcode3_entity(payload: &[u8]) -> String {
 }
 
 fn log_remote_count(n: usize, eid: &str, uid: u16) {
-    log_line(&format!(
+    debug_log(&format!(
         "EndpointCreated remote uid={uid} entity={eid} remotes={n}"
     ));
     if n == 4 {
-        log_line("WATCH_4 remotes=4 (shipping Party maxUserCount; 4 others + local = 5 mesh users)");
+        debug_log("WATCH_4 remotes=4 (shipping Party maxUserCount; 4 others + local = 5 mesh users)");
     }
     if n == 5 {
-        log_line("WATCH_4 remotes=5 (beyond shipping 4-user mesh if exe still sends maxUserCount=4)");
+        debug_log("WATCH_4 remotes=5 (beyond shipping 4-user mesh if exe still sends maxUserCount=4)");
     }
 }
 
@@ -956,7 +972,7 @@ fn id_table_note(base: usize) -> String {
             }
         }
         if LAST_ID_MASK.swap(mask as u64, Ordering::SeqCst) != mask as u64 {
-            log_line(&format!("lookup_ids filled={filled}/12 mask={mask:#06x}"));
+            debug_log(&format!("lookup_ids filled={filled}/12 mask={mask:#06x}"));
         }
         format!(" ids={filled}/12")
     }
@@ -1413,7 +1429,7 @@ fn ledger_text(h: &Handle, tag: &str) -> String {
 }
 
 fn ledger_line(h: &Handle, tag: &str) {
-    log_line(&ledger_text(h, tag));
+    debug_log(&ledger_text(h, tag));
 }
 
 /// P5 bound on `h.pending`: drop a type-21 when the queue is at `PENDING_CAP`, with a
@@ -1666,7 +1682,7 @@ fn ensure_remote(
     // has finished the type-10 SC.
     if n.local_endpoint.is_null() || !n.type10_delivered {
         if !TYPE12_HELD_LOG.swap(true, Ordering::Relaxed) {
-            log_line(&format!(
+            debug_log(&format!(
                 "ensure_remote hold type12 entity={eid} until type10 delivered"
             ));
         }
@@ -1684,7 +1700,7 @@ fn ensure_remote(
                     // fill-in: a guest that rebound to an ephemeral port
                     // (fixed port still busy) must stay reachable.
                     if e.udp_port != 0 && !is_loopback_ip(&e.ip) {
-                        log_line(&format!(
+                        debug_log(&format!(
                             "remote endpoint moved entity={eid} old={}:{} new={ip}:{udp_port}",
                             e.ip, e.udp_port
                         ));
@@ -1701,7 +1717,7 @@ fn ensure_remote(
     // Plant only on skip-connect (exe never ConnectToNetwork).
     if !unsafe { member_list_has_entity(eid) } {
         if !TYPE12_MEMBER_HELD_LOG.swap(true, Ordering::Relaxed) {
-            log_line(&format!(
+            debug_log(&format!(
                 "ensure_remote hold type12 entity={eid} until native FUN_140260b30 insert"
             ));
         }
@@ -1736,7 +1752,7 @@ fn ensure_remote(
             ptr::write_unaligned(sc.add(0x10) as *mut *mut Endpoint, ep);
         }
         queue_sc(h, sc);
-        log_line(&format!(
+        debug_log(&format!(
             "EndpointCreated remote entity={eid} uid={uid} ip={ip}:{udp_port}"
         ));
         log_remote_count(n.remotes.len(), eid, uid);
@@ -1852,7 +1868,7 @@ unsafe fn deliver_type21(
     let op = u32le(payload, 0).unwrap_or(0);
     if is_chara_snapshot(op, payload.len()) {
         note_snapshot();
-        log_line(&format!("snapshot_delivered opcode={op} len={}", payload.len()));
+        debug_log(&format!("snapshot_delivered opcode={op} len={}", payload.len()));
     }
 }
 
@@ -1886,7 +1902,7 @@ unsafe fn flush_pending_rx(h: &mut Handle, net: *mut Network) {
         count += 1;
     }
     if count > 0 {
-        log_line(&format!("recv replay n={count}"));
+        debug_log(&format!("recv replay n={count}"));
     }
 }
 
@@ -2070,7 +2086,7 @@ fn recv_udp(h: &mut Handle) {
                     }
                     if kind == KIND_HELLO {
                         if should_log_payload(&format!("hello:{ent}")) {
-                            log_line(&format!("recv hello from={ent} remotes={}", n.remotes.len()));
+                            debug_log(&format!("recv hello from={ent} remotes={}", n.remotes.len()));
                         }
                         unsafe { request_peer_poll(net) };
                         continue;
@@ -2125,13 +2141,13 @@ fn recv_udp(h: &mut Handle) {
                         // until type 12 has inserted the Party peer.
                         if n.pending_rx.len() >= 128 {
                             if let Some((old_ent, old_payload, _, _)) = n.pending_rx.pop_front() {
-                                log_line(&format!(
+                                debug_log(&format!(
                                     "recv evict pending entity={old_ent} len={} cap=128",
                                     old_payload.len()
                                 ));
                             }
                         }
-                        log_line(&format!(
+                        debug_log(&format!(
                             "recv buffered opcode pending entity={ent} ep_null={} local_ep_null={} type12={} remotes={} queued={}",
                             ep.is_null(),
                             n.local_endpoint.is_null(),
@@ -2401,7 +2417,7 @@ fn ensure_transport_thread() {
     if force_inline_threads() {
         static LOGGED: AtomicBool = AtomicBool::new(false);
         if !LOGGED.swap(true, Ordering::Relaxed) {
-            log_line(
+            debug_log(
                 "transport disabled (GBFR_PARTY_FORCE_INLINE); using tick-driven inline transport",
             );
         }
@@ -2490,7 +2506,7 @@ unsafe fn note_send_diag(
 ) {
     let remotes = (*net).remotes.len();
     if target_count == 4 {
-        log_line(&format!(
+        debug_log(&format!(
             "WATCH_4 send target_count=4 remotes={remotes} len={}",
             payload.len()
         ));
@@ -2624,7 +2640,7 @@ fn transport_heartbeat(now: u64) {
         return;
     }
     XPORT_HB_MS.store(now, Ordering::Relaxed);
-    log_line(&format!(
+    debug_log(&format!(
         "transport[heartbeat] tid={:#010x} up={} wakeups={} jobs={} datagrams_rx={} datagrams_tx={} outbox_depth={} outbox_hwm={} poll_ms={TRANSPORT_POLL_MS}",
         XPORT_TID.load(Ordering::Relaxed),
         TRANSPORT_UP.load(Ordering::Relaxed),
@@ -2666,7 +2682,7 @@ fn transport_loop() {
     XPORT_TID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
     // Idle wakeups must not be quantized to the ~15.6 ms system tick (see timeBeginPeriod above).
     let tbp = unsafe { timeBeginPeriod(1) };
-    log_line(&format!(
+    debug_log(&format!(
         "transport thread started tid={:#010x} poll_ms={TRANSPORT_POLL_MS} timer_res=1ms(tbp={tbp}) owns=udp/send/recv/rto/forced-ack",
         XPORT_TID.load(Ordering::Relaxed)
     ));
@@ -2780,7 +2796,7 @@ fn ensure_broker_thread() {
     if force_inline_threads() {
         static LOGGED: AtomicBool = AtomicBool::new(false);
         if !LOGGED.swap(true, Ordering::Relaxed) {
-            log_line("broker disabled (GBFR_PARTY_FORCE_INLINE); broker I/O runs inline (blocking)");
+            debug_log("broker disabled (GBFR_PARTY_FORCE_INLINE); broker I/O runs inline (blocking)");
         }
         return;
     }
@@ -2883,7 +2899,7 @@ fn broker_thread_main() {
 }
 
 fn broker_loop() {
-    log_line(&format!(
+    debug_log(&format!(
         "broker thread started tid={:#010x} owns=/party/join,/party/leave,/party/peers",
         unsafe { GetCurrentThreadId() }
     ));
@@ -2919,7 +2935,7 @@ fn broker_run(task: BrokerTask) {
                 "{{\"network_id\":\"{network_id}\",\"entity_id\":\"{entity}\",\"udp_port\":{udp_port},\"ip\":\"{ip_s}\"}}"
             );
             if !quiet {
-                log_line(&format!(
+                debug_log(&format!(
                     "party register entity={entity} ip={ip_s} udp={udp_port}"
                 ));
             }
@@ -3028,7 +3044,7 @@ fn serialize_desc(d: &Descriptor, out: *mut c_char) -> u32 {
         ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, bytes.len());
         *out.add(bytes.len()) = 0;
     }
-    log_throttled("serialize", &format!("Serialize {s}"));
+    debug_throttled("serialize", &format!("Serialize {s}"));
     SUCCESS
 }
 
@@ -3044,7 +3060,7 @@ fn deserialize_desc(s: *const c_char, out: *mut Descriptor) -> u32 {
     let raw = read_cstr(s);
     // Relink posts lobby key network_descriptor="dummy" before PartySerialize.
     if !raw.starts_with("LAN1.") {
-        log_line(&format!(
+        debug_log(&format!(
             "Deserialize ignore (not LAN1) raw={raw} (out descriptor cleared)"
         ));
         return ERR;
@@ -3068,7 +3084,7 @@ pub extern "C" fn PartySetWorkMode(_thread: i32, _mode: i32) -> u32 {
 #[no_mangle]
 pub unsafe extern "C" fn PartyInitialize(title_id: *const c_char, handle: *mut *mut c_void) -> u32 {
     note_party_thread();
-    log_line(&format!(
+    debug_log(&format!(
         "PartyInitialize title_id={:p} handle_out={:p}",
         title_id, handle
     ));
@@ -3080,7 +3096,7 @@ pub unsafe extern "C" fn PartyInitialize(title_id: *const c_char, handle: *mut *
     } else {
         CString::new(read_cstr(title_id)).unwrap_or_else(|_| CString::new("lan").unwrap())
     };
-    log_line(&format!("PartyInitialize title={}", title.to_string_lossy()));
+    debug_log(&format!("PartyInitialize title={}", title.to_string_lossy()));
     IS_HOST.store(false, Ordering::SeqCst);
     GUEST_SUB5_SENT.store(false, Ordering::SeqCst);
     HOST_SNAPSHOT.store(false, Ordering::SeqCst);
@@ -3150,7 +3166,7 @@ pub unsafe extern "C" fn PartyCreateLocalUser(
         return ERR;
     }
     let ent = read_cstr(entity_id);
-    log_line(&format!("PartyCreateLocalUser entity={ent}"));
+    debug_log(&format!("PartyCreateLocalUser entity={ent}"));
     let boxed = Box::new(LocalUser {
         entity: CString::new(ent).unwrap_or_else(|_| CString::new("user").unwrap()),
     });
@@ -3192,7 +3208,7 @@ pub unsafe extern "C" fn PartyCreateNewNetwork(
     _out_invite: *mut c_char,
 ) -> u32 {
     note_party_thread();
-    log_line("PartyCreateNewNetwork");
+    debug_log("PartyCreateNewNetwork");
     note_export(EXP_CREATE_NETWORK);
     IS_HOST.store(true, Ordering::SeqCst);
     if !_config.is_null() {
@@ -3201,14 +3217,14 @@ pub unsafe extern "C" fn PartyCreateNewNetwork(
         let max_devices = ptr::read_unaligned((_config as *const u8).add(4) as *const u32);
         let per_dev = ptr::read_unaligned((_config as *const u8).add(8) as *const u32);
         let per_user = ptr::read_unaligned((_config as *const u8).add(12) as *const u32);
-        log_line(&format!(
+        debug_log(&format!(
             "PartyCreateNewNetwork config maxUserCount={max_users} maxDeviceCount={max_devices} maxUsersPerDevice={per_dev} maxDevicesPerUser={per_user}"
         ));
         if max_users == 4 || max_devices == 4 {
-            log_line("WATCH_4 exe still creating Party mesh with maxUserCount/maxDeviceCount=4");
+            debug_log("WATCH_4 exe still creating Party mesh with maxUserCount/maxDeviceCount=4");
         }
     } else {
-        log_line("PartyCreateNewNetwork config=null (shim does not enforce maxUserCount)");
+        debug_log("PartyCreateNewNetwork config=null (shim does not enforce maxUserCount)");
     }
     let ident = uuid_ident();
     let invite = CString::new("lan-invite").unwrap();
@@ -3257,7 +3273,7 @@ pub unsafe extern "C" fn PartyCreateNewNetwork(
     if !ent.is_empty() {
         register_member(unsafe { &*netp }, &ent);
     }
-    log_line(&format!(
+    debug_log(&format!(
         "PartyCreateNewNetwork id={ident} udp={port} advert={}",
         ip_string(advert)
     ));
@@ -3303,7 +3319,7 @@ unsafe fn emit_connect_completed(h: &mut Handle, netp: *mut Network) {
         ptr::write_unaligned(sc.add(0x180) as *mut *mut Network, netp);
         queue_sc(h, sc);
     }
-    log_line(&format!(
+    debug_log(&format!(
         "PartyConnectToNetwork id={} udp={} (state_change type=3 follows)",
         (*netp).descriptor.id_str(),
         (*netp).udp_port
@@ -3404,7 +3420,7 @@ pub unsafe extern "C" fn PartyDeserializeNetworkDescriptor(
     let raw = read_cstr(serialized);
     let r = deserialize_desc(serialized, descriptor);
     if r == SUCCESS {
-        log_line(&format!(
+        debug_log(&format!(
             "Deserialize raw={raw} id={} (waiting for exe FUN_1425137c0 PartyConnectToNetwork)",
             if descriptor.is_null() {
                 "?".into()
@@ -3458,7 +3474,7 @@ pub unsafe extern "C" fn PartyNetworkAuthenticateLocalUser(
         (*(local_user as *mut LocalUser)).entity.to_string_lossy().into_owned()
     };
     if !ent.is_empty() {
-        log_line(&format!("WATCH_4 AuthenticateLocalUser entity={ent}"));
+        debug_log(&format!("WATCH_4 AuthenticateLocalUser entity={ent}"));
     }
     with_handle(
         ptr::null_mut(),
@@ -3499,7 +3515,7 @@ pub unsafe extern "C" fn PartyNetworkCreateEndpoint(
     } else {
         (* (local_user as *mut LocalUser)).entity.clone()
     };
-    log_line(&format!(
+    debug_log(&format!(
         "CreateEndpoint uid={uid} entity={}",
         ent.to_string_lossy()
     ));
@@ -3684,7 +3700,7 @@ unsafe fn log_connect_gate_inputs() {
             inv = ptr::read_unaligned((party + 0x218) as *const u64);
         }
     }
-    log_line(&format!(
+    debug_log(&format!(
         "connect-gate inputs send={send:#x} +18={p18:#x} [+18]+38={inner:#x} party+38={party:#x} desc0={b0} inv={inv}"
     ));
 }
@@ -3962,7 +3978,7 @@ unsafe fn quest_guard_note() {
             s.push_str(&format!(" session+4={s4} +4ac={s4ac}"));
         }
     }
-    log_throttled("quest_guard", &s);
+    debug_throttled("quest_guard", &s);
 }
 
 /// Quest-start sync-machine probe (read-only). `syncStart` (0x140B14A60) builds a 9-state machine;
@@ -3998,7 +4014,7 @@ unsafe fn quest_sync_note() {
             s.push_str(&format!(" ({name}v={a}/{b}/{c})"));
         }
     }
-    log_throttled("quest_sync", &s);
+    debug_throttled("quest_sync", &s);
 }
 
 /// Quest-start guard: the game's notification/error sink (read-only). This is NOT a per-member
@@ -4018,7 +4034,7 @@ unsafe fn quest_array_note() {
     }
     let p = ptr::read_unaligned((base + ARR_RVA) as *const usize);
     if p == 0 {
-        log_throttled("quest_array", "quest_array p=0");
+        debug_throttled("quest_array", "quest_array p=0");
         return;
     }
     // Guard priority order: bucket 4 (base +0x70 / count +0x80) first, then 3, 2, 1.
@@ -4053,7 +4069,7 @@ unsafe fn quest_array_note() {
     if !picked {
         s.push_str(" all_buckets_empty");
     }
-    log_throttled("quest_array", &s);
+    debug_throttled("quest_array", &s);
 }
 
 /// Quest-action result probe (read-only). `DecisionStartQuestOnMulti` (0x141CB7BA0) writes a status
@@ -4070,7 +4086,7 @@ unsafe fn quest_action_note() {
     }
     let p = ptr::read_unaligned((base + OBJ_RVA) as *const usize);
     if p == 0 {
-        log_throttled("quest_action", "quest_action p=0");
+        debug_throttled("quest_action", "quest_action p=0");
         return;
     }
     if !readable(p.wrapping_add(0x108), 8) {
@@ -4400,7 +4416,7 @@ fn async_verdict(st: &AsyncState) -> &'static str {
 }
 
 unsafe fn asyncload_note() {
-    log_throttled_lazy("asyncload", |_| {
+    debug_throttled_lazy("asyncload", |_| {
         let st = read_async_state();
         let mut s = match st.mgr {
             None => return format!("asyncload h={ASYNC_OP_HASH:#010x} mgr=global_ro"),
@@ -4581,7 +4597,7 @@ unsafe fn mode3_gate_note() {
     MODE3_GATE_AT.store(now, Ordering::Relaxed);
 
     // Emitting: only now build the line (probe-cost rule).
-    log_line(&format!(
+    debug_log(&format!(
         "mode3gate rm={} arm3={} done3={} skip3={} jobs={}/{} qm={} sel={} obs={}/{} exp={}/{} canmatch={} online={} sess={} net={}",
         sptr(rm),
         s32(arm3),
@@ -4674,7 +4690,7 @@ fn ensure_sampler_thread() {
 
 fn solo_sampler_thread_main() {
     SOLO_TID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
-    log_line(&format!(
+    debug_log(&format!(
         "solo sampler thread started tid={:#010x} period_ms={SOLO_SAMPLE_MS} heartbeat_ms={SOLO_HEARTBEAT_MS} read_only=1",
         SOLO_TID.load(Ordering::Relaxed)
     ));
@@ -4847,7 +4863,7 @@ unsafe fn solo_sample_note() {
         s.push_str(&format!(" {name}={}", s32(quest[i])));
     }
     s.push_str(&format!(" emit={}", SOLO_EMITTED.load(Ordering::Relaxed)));
-    log_line(&s);
+    debug_log(&s);
 }
 
 unsafe fn probe_session() {
@@ -4988,7 +5004,7 @@ unsafe fn probe_session() {
         }
     };
     if changed || due {
-        log_line(&format!("probe_session {role}: {note} {}", thread_probe_note()));
+        debug_log(&format!("probe_session {role}: {note} {}", thread_probe_note()));
     }
 }
 
@@ -5126,7 +5142,7 @@ unsafe fn mesh_trigger_timeline() {
     );
     let key = fnv1a(&note);
     if MESH_TRIGGER_KEY.swap(key, Ordering::Relaxed) != key || left % 8 == 0 {
-        log_line(&note);
+        debug_log(&note);
     }
 }
 
@@ -5148,7 +5164,7 @@ pub unsafe extern "C" fn PartyStartProcessingStateChanges(
         if invitation != 0 {
             // [deleted] the exe mesh-start hack used to be called here; removed because the shim must not drive game internals.
         } else if debug_enabled() {
-            log_throttled_lazy("mesh_arm_wait", |_| {
+            debug_throttled_lazy("mesh_arm_wait", |_| {
                 format!(
                     "mesh-start armed but party+0x218 is still 0 (party={party:#x}): waiting for the exe invitation copy (PTY-8); not firing from Deserialize"
                 )
@@ -5238,8 +5254,8 @@ pub unsafe extern "C" fn PartyStartProcessingStateChanges(
                 // only on the peer that attempted the mesh start. So at a load-screen stall (later,
                 // possibly the other peer) there was no `+70`/`+a0` and no ready-row `+0x10` at all.
                 // Emit both every pass on both peers; log_throttled caps them at one line/second.
-                log_throttled("rows", &work_rows_note());
-                log_throttled("ready", &queue_rows_note());
+                debug_throttled("rows", &work_rows_note());
+                debug_throttled("ready", &queue_rows_note());
             }
             // Reclaim the previous batch. The contract is that each state change is returned to
             // FinishProcessingStateChanges exactly once and the library then reclaims it. We never
@@ -5340,7 +5356,7 @@ pub unsafe extern "C" fn PartyStartProcessingStateChanges(
                 } else {
                     "type12-in-this-batch"
                 };
-                log_throttled_lazy("type21_defer", |_| {
+                debug_throttled_lazy("type21_defer", |_| {
                     format!(
                         "type-21 deferral pending={depth} deferred={count} deferred_total={total} reason={reason} held_ms={type12_held_ms} timed_out={type12_timed_out} (P5 timeout={TYPE12_HOLD_TIMEOUT_MS}ms cap={PENDING_CAP})"
                     )
@@ -5388,7 +5404,7 @@ pub unsafe extern "C" fn PartyStartProcessingStateChanges(
                 }
                 let has_ctrl = types[2] + types[3] + types[4] + types[10] + types[12] + types[13] + types[19] > 0;
                 if has_ctrl || should_log_payload("pump") {
-                    log_line(&format!(
+                    debug_log(&format!(
                         "PartyStartProcessing n={} types=[{}]",
                         h.in_flight.len(),
                         parts.join(" ")
@@ -5453,7 +5469,7 @@ pub unsafe extern "C" fn PartyFinishProcessingStateChanges(
             if !net.is_null() {
                 t12_done.push(net);
                 let _ = TYPE12_MS.compare_exchange(0, now_ms(), Ordering::SeqCst, Ordering::SeqCst);
-                log_line("type12 finished; will replay recv next pump");
+                debug_log("type12 finished; will replay recv next pump");
             }
         }
         if ty == 21 {
@@ -5498,7 +5514,7 @@ pub unsafe extern "C" fn PartyFinishProcessingStateChanges(
                 // number reclaimed is already carried by `last_reclaimed` in the heartbeat.
                 let hr: &Handle = h;
                 if debug_enabled() {
-                    log_throttled_lazy("ledger_finish", |_| {
+                    debug_throttled_lazy("ledger_finish", |_| {
                         format!(
                             "delivery ledger[finish] reclaimed={reclaimed} in_flight_before={in_flight_before} back=[{}] pending={}",
                             fmt_type_counts(&back),
@@ -5526,7 +5542,7 @@ unsafe fn log_leave_stack() {
             s.push_str(&format!(" {:p}", frames[i]));
         }
     }
-    log_line(&s);
+    debug_log(&s);
 }
 
 #[no_mangle]
@@ -5536,7 +5552,7 @@ pub unsafe extern "C" fn PartyNetworkLeaveNetwork(
 ) -> u32 {
     note_party_thread();
     log_leave_stack();
-    log_line("PartyNetworkLeaveNetwork");
+    debug_log("PartyNetworkLeaveNetwork");
     note_export(EXP_LEAVE);
     with_handle(
         ptr::null_mut(),
@@ -5604,7 +5620,7 @@ pub unsafe extern "C" fn PartyDestroyLocalUser(
 #[no_mangle]
 pub unsafe extern "C" fn PartyCleanup(handle: *mut c_void) -> u32 {
     note_party_thread();
-    log_line("PartyCleanup");
+    debug_log("PartyCleanup");
     note_export(EXP_CLEANUP);
     let _ = handle;
     if let Ok(mut guard) = g().lock() {
@@ -5674,7 +5690,7 @@ pub unsafe extern "C" fn PartyGetErrorMessage(error: u32, out: *mut *const c_cha
 #[no_mangle]
 pub extern "system" fn DllMain(_m: *mut c_void, reason: u32, _r: *mut c_void) -> i32 {
     if reason == 1 {
-        log_line(concat!(
+        debug_log(concat!(
             "PartyWin.dll LAN stub loaded build=",
             env!("BUILD_STAMP")
         ));

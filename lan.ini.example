@@ -53,6 +53,7 @@ advertise_ip =
 [debug]
 ; Verbose logging for troubleshooting: per-message Party traffic, payload hex samples,
 ; quest/queue probes, and one line per broker request.
-; false = lifecycle, lobby/quest transitions and errors only (recommended for normal play).
+; false = errors and warnings only (recommended for normal play; the broker still prints
+; non-poll request activity to its console).
 ; GBFR_LAN_DEBUG=1 overrides this for a single process.
 enabled = false

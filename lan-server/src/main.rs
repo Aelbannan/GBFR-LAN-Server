@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -403,7 +403,7 @@ fn drop_owner_lobbies(app: &mut App, owner_id: &str) {
         .collect();
     for id in stale {
         app.lobbies.remove(&id);
-        log_line(&format!(
+        request_log(&format!(
             "CreateLobby drop stale {id} owner={owner_id}"
         ));
     }
@@ -743,9 +743,7 @@ const LOG_REOPEN_MS: u128 = 5000;
 static LOG_FILE: std::sync::OnceLock<Mutex<Option<(std::fs::File, std::time::Instant)>>> =
     std::sync::OnceLock::new();
 
-fn log_line(msg: &str) {
-    let line = format!("[{}] {msg}", ts());
-    println!("{line}");
+fn write_log_file(line: &str) {
     let m = LOG_FILE.get_or_init(|| Mutex::new(None));
     let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
     let stale = match g.as_ref() {
@@ -780,54 +778,33 @@ fn log_line(msg: &str) {
     }
 }
 
-/// Per-request logging. `[debug] enabled` logs every request. By default every non-poll request
-/// is logged, but the two hot poll routes (97% of request lines in a measured run) are counted
-/// and summarised once per `REQUEST_ROLLUP_SECS` instead.
-const REQUEST_ROLLUP_SECS: u64 = 30;
-static POLL_PEERS: AtomicU64 = AtomicU64::new(0);
-static POLL_GETLOBBY: AtomicU64 = AtomicU64::new(0);
-static REQUEST_ROLLUP_AT: AtomicU64 = AtomicU64::new(0);
+/// Errors and warnings: always written to the log file and the console.
+fn log_line(msg: &str) {
+    let line = format!("[{}] {msg}", ts());
+    println!("{line}");
+    write_log_file(&line);
+}
 
-fn log_request(method: &str, host: &str, path: &str) {
+/// Broker activity (startup, requests, WS traffic): visible on the console while the broker
+/// runs, written to the file only in `[debug]` mode. No periodic output when debug is off.
+fn request_log(msg: &str) {
+    let line = format!("[{}] {msg}", ts());
+    println!("{line}");
     if lan_cfg::debug_enabled() {
-        log_line(&format!("{method} host={host} path={path}"));
+        write_log_file(&line);
+    }
+}
+
+/// Per-request logging. Non-poll requests go to the console always (file only in `[debug]`).
+/// The two hot poll routes are silent unless `[debug]` is on; there is no rollup.
+fn log_request(method: &str, host: &str, path: &str) {
+    if path == "/party/peers" || path == "/Lobby/GetLobby" {
+        if lan_cfg::debug_enabled() {
+            log_line(&format!("{method} host={host} path={path}"));
+        }
         return;
     }
-    let poll = if path == "/party/peers" {
-        1u8
-    } else if path == "/Lobby/GetLobby" {
-        2u8
-    } else {
-        0u8
-    };
-    if poll == 0 {
-        log_line(&format!("{method} host={host} path={path}"));
-        return;
-    }
-    if poll == 1 {
-        POLL_PEERS.fetch_add(1, Ordering::Relaxed);
-    } else {
-        POLL_GETLOBBY.fetch_add(1, Ordering::Relaxed);
-    }
-    let now = now_unix() as u64;
-    let last = REQUEST_ROLLUP_AT.load(Ordering::Relaxed);
-    if last != 0 && now.saturating_sub(last) < REQUEST_ROLLUP_SECS {
-        return;
-    }
-    if REQUEST_ROLLUP_AT
-        .compare_exchange(last, now, Ordering::SeqCst, Ordering::Relaxed)
-        .is_err()
-    {
-        return;
-    }
-    let peers = POLL_PEERS.swap(0, Ordering::Relaxed);
-    let lobbies = POLL_GETLOBBY.swap(0, Ordering::Relaxed);
-    if peers + lobbies > 0 {
-        log_line(&format!(
-            "http poll rollup ({}s) party/peers={peers} Lobby/GetLobby={lobbies}",
-            REQUEST_ROLLUP_SECS
-        ));
-    }
+    request_log(&format!("{method} host={host} path={path}"));
 }
 
 /// Emit `msg` at most once per `RATE_LIMIT_SECS` for a given key. The key set is capped, so a
@@ -968,7 +945,7 @@ fn handle_playfab(
             .or_else(|| json_str(body, "steamTicket"))
             .unwrap_or("");
         let player = player_from_ticket(app, ticket);
-        log_line(&format!("LoginWithSteam PlayFabId={}", player.playfab_id));
+        request_log(&format!("LoginWithSteam PlayFabId={}", player.playfab_id));
         return Some(playfab_ok(login_result(&player)));
     }
 
@@ -1002,7 +979,7 @@ fn handle_playfab(
             .unwrap_or_else(|| player_from_ticket(app, "anonymous"));
         let id = create_lobby(app, body, &player);
         let lobby = app.lobbies.get(&id).unwrap();
-        log_line(&format!(
+        request_log(&format!(
             "CreateLobby {id} search_keys=[{}] lobby_keys=[{}]",
             map_keys(&lobby.search_data),
             map_keys(&lobby.lobby_data)
@@ -1061,7 +1038,7 @@ fn handle_playfab(
             }
         } else {
             if lobby.members.len() as i64 >= lobby.max_players {
-                log_line(&format!(
+                request_log(&format!(
                     "JoinLobby full id={} members={} max={}",
                     lobby.id,
                     lobby.members.len(),
@@ -1077,7 +1054,7 @@ fn handle_playfab(
                 "MemberData": member_data,
             }));
         }
-        log_line(&format!(
+        request_log(&format!(
             "JoinLobby id={} members={}",
             lobby.id,
             lobby.members.len()
@@ -1229,7 +1206,7 @@ fn handle_playfab(
                 "Owner": lobby.owner,
             }));
         }
-        log_line(&format!(
+        request_log(&format!(
             "FindLobbies n={} ids=[{}] filter=\"{}\" sort=\"{}\" count={} warnings=[{}] sk5=[{}]",
             ids.len(),
             ids.join(","),
@@ -1293,7 +1270,7 @@ fn handle_playfab(
             if !closed {
                 app.lobbies.insert(lid.to_string(), lobby);
             }
-            log_line(&format!(
+            request_log(&format!(
                 "LeaveLobby {lid} members={} closed={closed} owner_left={owner_left}{owner_note}",
                 if closed { 0 } else { remain }
             ));
@@ -1370,7 +1347,7 @@ fn handle_playfab(
                     lobby.search_data.insert(k.clone(), v.clone());
                 }
             }
-            log_line(&format!(
+            request_log(&format!(
                 "UpdateLobby {lid} search_keys=[{}] lobby_keys=[{}] search_del=[{}] lobby_del=[{}] member_del=[{}] lock={}",
                 map_keys(&lobby.search_data),
                 map_keys(&lobby.lobby_data),
@@ -1485,7 +1462,7 @@ fn handle_party(
         if is_loopback_ip(&ip) {
             if let Some(peer) = headers.get("x-peer-ip") {
                 if !is_loopback_ip(peer) {
-                    log_line(&format!(
+                    request_log(&format!(
                         "party join rewrote loopback {ip} -> {peer} entity={eid}"
                     ));
                     ip = peer.clone();
@@ -1545,7 +1522,7 @@ fn handle_party(
                 })
             })
             .collect();
-        log_line(&format!(
+        request_log(&format!(
             "party join network={nid} entity={eid} udp={ip}:{port} members={}",
             members.len()
         ));
@@ -1696,7 +1673,7 @@ fn dispatch(
         let raw = serde_json::to_vec(&cfg).unwrap_or_default();
         if stripped.ends_with(".blob") {
             let blob = encode_boot_blob(&raw);
-            log_line(&format!("boot .blob {} json -> {} b64", raw.len(), blob.len()));
+            request_log(&format!("boot .blob {} json -> {} b64", raw.len(), blob.len()));
             return (200, "application/octet-stream", blob);
         }
         return (200, "application/json", raw);
@@ -1755,12 +1732,12 @@ fn handle_ws_payload(stream: &mut TcpStream, data: &[u8]) {
     } else {
         preview.into_owned()
     };
-    log_line(&format!("ws frame len={} {shown}", data.len()));
+    request_log(&format!("ws frame len={} {shown}", data.len()));
     // Exe FUN_14290b160 requires root command (string) + params (object). Extra keys are
     // skip-safe; lobby_search_id lives under params, not at the root.
     let reply = if let Ok(v) = serde_json::from_slice::<Value>(data) {
         let cmd = v.get("command").and_then(|c| c.as_str()).unwrap_or("");
-        log_line(&format!("ws command={cmd}"));
+        request_log(&format!("ws command={cmd}"));
         let mut params = match v.get("params") {
             Some(Value::Object(m)) => m.clone(),
             _ => serde_json::Map::new(),
@@ -1786,7 +1763,7 @@ fn handle_ws_payload(stream: &mut TcpStream, data: &[u8]) {
     };
     if let Ok(body) = serde_json::to_vec(&reply) {
         if ws_send_binary(stream, &body) {
-            log_line(&format!(
+            request_log(&format!(
                 "ws reply command={} len={}",
                 reply.get("command").and_then(|c| c.as_str()).unwrap_or(""),
                 body.len()
@@ -1849,14 +1826,14 @@ fn pump_websocket(stream: &mut TcpStream) {
         if opcode == 0x1 || opcode == 0x2 {
             handle_ws_payload(stream, &data);
         } else {
-            log_line(&format!(
+            request_log(&format!(
                 "ws frame opcode={opcode} len={} head={}",
                 data.len(),
                 data.iter().take(32).map(|b| format!("{b:02x}")).collect::<String>()
             ));
         }
     }
-    log_line("websocket closed");
+    request_log("websocket closed");
 }
 
 fn handle_ws_upgrade(stream: &mut TcpStream, headers: &HashMap<String, String>) -> bool {
@@ -1878,7 +1855,7 @@ fn handle_ws_upgrade(stream: &mut TcpStream, headers: &HashMap<String, String>) 
     if stream.write_all(hdr.as_bytes()).is_err() {
         return true;
     }
-    log_line("websocket connected");
+    request_log("websocket connected");
     pump_websocket(stream);
     true
 }
@@ -2050,7 +2027,7 @@ fn listen(addr: &str, app: Arc<Mutex<App>>, name: &str) {
         eprintln!("bind {addr} failed: {e}");
         std::process::exit(1);
     });
-    log_line(&format!("{name} {addr}"));
+    request_log(&format!("{name} {addr}"));
     for s in listener.incoming() {
         match s {
             Ok(stream) => {
@@ -2090,7 +2067,7 @@ fn load_lobby_ini(path: &str) -> (i64, bool) {
                 _ => {}
             }
         }
-        log_line(&format!("loaded ini {path}"));
+        request_log(&format!("loaded ini {path}"));
     }
     (clamp_max_players(max), override_game)
 }
@@ -2175,10 +2152,10 @@ fn main() {
         lobbies: HashMap::new(),
         party: HashMap::new(),
     }));
-    log_line(&format!(
+    request_log(&format!(
         "lobby max_players={max} override_game_max={override_game_max} title={title} (broker lobby+party cap={max})"
     ));
-    log_line("HTTP only (no TLS). Clients use lan.ini [server] host/port.");
+    request_log("HTTP only (no TLS). Clients use lan.ini [server] host/port.");
     let http_app = app.clone();
     let ws_app = app;
     let http_addr = format!("0.0.0.0:{http_port}");

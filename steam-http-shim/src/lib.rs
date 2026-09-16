@@ -377,7 +377,7 @@ unsafe fn callback_run_index(obj: usize, default: usize) -> usize {
         let code = std::slice::from_raw_parts(f as *const u8, 16);
         if let Some(sz) = mov_eax_imm(code) {
             if (1..8192).contains(&sz) && i >= 2 {
-                log_msg(&format!(
+                debug_log(&format!(
                     "callback {:#x} GetCallbackSizeBytes slot={} size={} -> Run slot={}",
                     obj,
                     i,
@@ -423,7 +423,7 @@ unsafe extern "system" fn get_auth_ticket_webapi(this: *mut c_void, identity: *c
     if !lan_identity {
         if let Some(orig) = ORIG_WEBAPI.get() {
             let h = orig(this, identity);
-            log_msg(&format!("GetAuthTicketForWebApi '{}' orig={}", id, h));
+            debug_log(&format!("GetAuthTicketForWebApi '{}' orig={}", id, h));
             if h != 0 {
                 return h;
             }
@@ -431,7 +431,7 @@ unsafe extern "system" fn get_auth_ticket_webapi(this: *mut c_void, identity: *c
     }
     let handle = NEXT_TICKET.fetch_add(1, Ordering::Relaxed);
     let ticket = String::from_utf8_lossy(&lan_steam_ticket()).into_owned();
-    log_msg(&format!(
+    debug_log(&format!(
         "GetAuthTicketForWebApi '{}' stub={} ticket={}",
         id, handle, ticket
     ));
@@ -446,7 +446,7 @@ unsafe extern "system" fn hook_reg_cb(cb: *mut c_void, i_callback: i32) {
             .unwrap()
             .callbacks
             .push((i_callback, cb as usize));
-        log_msg(&format!("RegisterCallback id={} cb={:p}", i_callback, cb));
+        debug_log(&format!("RegisterCallback id={} cb={:p}", i_callback, cb));
     }
     if let Some(orig) = ORIG_REG_CB.get() {
         orig(cb, i_callback);
@@ -480,7 +480,7 @@ fn dispatch_steam_user_callbacks() {
     for ptr in connected {
         let mut dummy = [0u8; 8];
         unsafe { invoke_callback(ptr, dummy.as_mut_ptr(), 0) };
-        log_msg(&format!("dispatched SteamServersConnected_t cb={:#x}", ptr));
+        debug_log(&format!("dispatched SteamServersConnected_t cb={:#x}", ptr));
     }
     for handle in tickets {
         let mut packed = pack_webapi_ticket(handle);
@@ -492,7 +492,7 @@ fn dispatch_steam_user_callbacks() {
                 n += 1;
             }
         }
-        log_msg(&format!(
+        debug_log(&format!(
             "dispatched GetTicketForWebApiResponse_t handle={} listeners={}",
             handle, n
         ));
@@ -975,7 +975,7 @@ unsafe extern "system" fn hook_run_callbacks() {
 unsafe extern "system" fn hook_reg_call(cb: *mut c_void, call: u64) {
     if !cb.is_null() && call != 0 {
         state().lock().unwrap().call_results.insert(call, cb as usize);
-        log_msg(&format!("RegisterCallResult call={:#x} cb={:p}", call, cb));
+        debug_log(&format!("RegisterCallResult call={:#x} cb={:p}", call, cb));
     }
     if let Some(orig) = ORIG_REG_CALL.get() {
         orig(cb, call);
@@ -1115,7 +1115,7 @@ unsafe extern "C" fn hook_svc_cfg(
 ) -> i32 {
     let ep = from_c(endpoint);
     let t = from_c(title);
-    log_msg(&format!("PFServiceConfigCreateHandle ep={} title={}", ep, t));
+    debug_log(&format!("PFServiceConfigCreateHandle ep={} title={}", ep, t));
     let rewrite = CString::new(lan_cfg().origin()).unwrap();
     if let Some(orig) = ORIG_SVC_CFG.get() {
         return orig(rewrite.as_ptr(), title, handle);
@@ -1138,7 +1138,7 @@ fn hook_playfab_iat() {
             hook_svc_cfg as *const () as usize,
         ) {
             let _ = ORIG_SVC_CFG.set(std::mem::transmute(old));
-            log_msg(&format!("IAT PFServiceConfigCreateHandle {:#x}", old));
+            debug_log(&format!("IAT PFServiceConfigCreateHandle {:#x}", old));
         } else {
             log_msg("IAT PFServiceConfigCreateHandle not found");
         }
@@ -1294,7 +1294,7 @@ fn hook_winhttp_modules() {
                 hook_wh_connect as *const () as usize,
             ) {
                 if old != hook_wh_connect as *const () as usize {
-                    log_msg(&format!("hooked WinHttpConnect in {:p}", m));
+                    debug_log(&format!("hooked WinHttpConnect in {:p}", m));
                 }
             }
             if let Some(old) = iat_replace(
@@ -1304,7 +1304,7 @@ fn hook_winhttp_modules() {
                 hook_wh_send as *const () as usize,
             ) {
                 if old != hook_wh_send as *const () as usize {
-                    log_msg(&format!("hooked WinHttpSendRequest in {:p}", m));
+                    debug_log(&format!("hooked WinHttpSendRequest in {:p}", m));
                 }
             }
             if ORIG_WH_OPEN.get().is_some() {
@@ -1315,7 +1315,7 @@ fn hook_winhttp_modules() {
                     hook_wh_open_request as *const () as usize,
                 ) {
                     if old != hook_wh_open_request as *const () as usize {
-                        log_msg(&format!("hooked WinHttpOpenRequest in {:p}", m));
+                        debug_log(&format!("hooked WinHttpOpenRequest in {:p}", m));
                     }
                 }
             }
@@ -1338,7 +1338,7 @@ fn hook_steam_iat() {
             hook_run_callbacks as usize,
         ) {
             let _ = ORIG_RUN_CALLBACKS.set(std::mem::transmute(old));
-            log_msg(&format!("IAT SteamAPI_RunCallbacks {:#x}", old));
+            debug_log(&format!("IAT SteamAPI_RunCallbacks {:#x}", old));
         } else {
             log_msg("IAT SteamAPI_RunCallbacks not found");
         }
@@ -1349,7 +1349,7 @@ fn hook_steam_iat() {
             hook_reg_call as usize,
         ) {
             let _ = ORIG_REG_CALL.set(std::mem::transmute(old));
-            log_msg(&format!("IAT SteamAPI_RegisterCallResult {:#x}", old));
+            debug_log(&format!("IAT SteamAPI_RegisterCallResult {:#x}", old));
         } else {
             log_msg("IAT SteamAPI_RegisterCallResult not found");
         }
@@ -1368,7 +1368,7 @@ fn hook_steam_iat() {
             hook_reg_cb as usize,
         ) {
             let _ = ORIG_REG_CB.set(std::mem::transmute(old));
-            log_msg(&format!("IAT SteamAPI_RegisterCallback {:#x}", old));
+            debug_log(&format!("IAT SteamAPI_RegisterCallback {:#x}", old));
         } else {
             log_msg("IAT SteamAPI_RegisterCallback not found");
         }
@@ -1500,11 +1500,11 @@ fn try_patch() -> bool {
             }
             patch_slot(uvt, USER_BLOGGED_ON, blogged_on as *mut c_void);
             patch_slot(uvt, USER_GET_AUTH_TICKET_WEBAPI, get_auth_ticket_webapi as *mut c_void);
-            log_msg(&format!("patched ISteamUser at {:p}", user));
+            debug_log(&format!("patched ISteamUser at {:p}", user));
             break;
         }
         hook_winhttp_modules();
-        log_msg(&format!("patched ISteamHTTP at {:p} and SteamUtils at {:p}", http, utils));
+        debug_log(&format!("patched ISteamHTTP at {:p} and SteamUtils at {:p}", http, utils));
         true
     }
 }
@@ -1579,7 +1579,7 @@ unsafe extern "C" fn on_load() {
     }
     let sys = load_sys_version();
     let _ = SYS_VERSION.set(sys as usize);
-    log_msg(concat!("loaded version.dll proxy build=", env!("BUILD_STAMP")));
+    debug_log(concat!("loaded version.dll proxy build=", env!("BUILD_STAMP")));
     hook_steam_iat();
     hook_playfab_iat();
     hook_winhttp_modules();
