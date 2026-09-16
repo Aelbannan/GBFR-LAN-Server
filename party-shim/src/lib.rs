@@ -758,6 +758,7 @@ fn bump_msg_stats(dir: &str, opcode: u32) {
 fn log_payload(dir: &str, extra: &str, payload: &[u8]) {
     let op = u32le(payload, 0).unwrap_or(0);
     let sub = u32le(payload, 4).unwrap_or(0);
+    idle_note(dir, op, sub);
     if dir == "send" && op == 3 && sub == 5 {
         GUEST_SUB5_SENT.store(true, Ordering::SeqCst);
     }
@@ -1324,6 +1325,63 @@ fn note_snapshot() {
     HOST_SNAPSHOT.store(true, Ordering::SeqCst);
     let _ = SNAPSHOT_MS.compare_exchange(0, now_ms(), Ordering::SeqCst, Ordering::SeqCst);
 }
+
+// ── Idle probe (debug) ───────────────────────────────────────────────────────
+// Last time each message class crossed the wire, in now_ms(). `log_payload` keeps these
+// current (send = the game call, recv = the wire), and `idle_report` prints how long each
+// class has been quiet. This distinguishes an AFK disconnect (action traffic stops,
+// heartbeats continue) from a network stall (everything stops). Atomics keep the per-message
+// paths lock-free; the report itself is behind the usual debug gate.
+static IDLE_ANY_TX: AtomicU64 = AtomicU64::new(0);
+static IDLE_ANY_RX: AtomicU64 = AtomicU64::new(0);
+/// op=2 sub=40: local action/hit RPC (input-driven).
+static IDLE_ACT_TX: AtomicU64 = AtomicU64::new(0);
+/// op=9: peer action/feedback (the counterpart of the local action stream).
+static IDLE_ACT_RX: AtomicU64 = AtomicU64::new(0);
+/// op=2 sub=65: ~3/s player-state sync (continues while AFK).
+static IDLE_HB_TX: AtomicU64 = AtomicU64::new(0);
+static IDLE_HB_RX: AtomicU64 = AtomicU64::new(0);
+
+fn idle_note(dir: &str, op: u32, sub: u32) {
+    let now = now_ms();
+    if dir == "send" {
+        IDLE_ANY_TX.store(now, Ordering::Relaxed);
+        if op == 2 && sub == 40 {
+            IDLE_ACT_TX.store(now, Ordering::Relaxed);
+        } else if op == 2 && sub == 65 {
+            IDLE_HB_TX.store(now, Ordering::Relaxed);
+        }
+    } else {
+        IDLE_ANY_RX.store(now, Ordering::Relaxed);
+        if op == 9 {
+            IDLE_ACT_RX.store(now, Ordering::Relaxed);
+        } else if op == 2 && sub == 65 {
+            IDLE_HB_RX.store(now, Ordering::Relaxed);
+        }
+    }
+}
+
+fn idle_age(last: u64, now: u64) -> String {
+    if last == 0 {
+        "never".to_string()
+    } else {
+        format!("{:.1}s", now.saturating_sub(last) as f64 / 1000.0)
+    }
+}
+
+fn idle_report() -> String {
+    let now = now_ms();
+    format!(
+        "idle any_tx={} any_rx={} act_tx(op2/40)={} act_rx(op9)={} hb_tx(op2/65)={} hb_rx(op2/65)={}",
+        idle_age(IDLE_ANY_TX.load(Ordering::Relaxed), now),
+        idle_age(IDLE_ANY_RX.load(Ordering::Relaxed), now),
+        idle_age(IDLE_ACT_TX.load(Ordering::Relaxed), now),
+        idle_age(IDLE_ACT_RX.load(Ordering::Relaxed), now),
+        idle_age(IDLE_HB_TX.load(Ordering::Relaxed), now),
+        idle_age(IDLE_HB_RX.load(Ordering::Relaxed), now),
+    )
+}
+
 static G: OnceLock<Mutex<Option<Box<Handle>>>> = OnceLock::new();
 static ERR_MSG: OnceLock<CString> = OnceLock::new();
 
@@ -2641,7 +2699,7 @@ fn transport_heartbeat(now: u64) {
     }
     XPORT_HB_MS.store(now, Ordering::Relaxed);
     debug_log(&format!(
-        "transport[heartbeat] tid={:#010x} up={} wakeups={} jobs={} datagrams_rx={} datagrams_tx={} outbox_depth={} outbox_hwm={} poll_ms={TRANSPORT_POLL_MS}",
+        "transport[heartbeat] tid={:#010x} up={} wakeups={} jobs={} datagrams_rx={} datagrams_tx={} outbox_depth={} outbox_hwm={} poll_ms={TRANSPORT_POLL_MS} {}",
         XPORT_TID.load(Ordering::Relaxed),
         TRANSPORT_UP.load(Ordering::Relaxed),
         XPORT_WAKEUPS.load(Ordering::Relaxed),
@@ -2650,6 +2708,7 @@ fn transport_heartbeat(now: u64) {
         XPORT_TX.load(Ordering::Relaxed),
         XPORT_OUTBOX_DEPTH.load(Ordering::Relaxed),
         XPORT_OUTBOX_HWM.load(Ordering::Relaxed),
+        idle_report(),
     ));
 }
 
@@ -5553,6 +5612,12 @@ pub unsafe extern "C" fn PartyNetworkLeaveNetwork(
     note_party_thread();
     log_leave_stack();
     debug_log("PartyNetworkLeaveNetwork");
+    debug_log(&format!(
+        "{} rows={} queue={}",
+        idle_report(),
+        work_rows_note(),
+        queue_rows_note()
+    ));
     note_export(EXP_LEAVE);
     with_handle(
         ptr::null_mut(),
