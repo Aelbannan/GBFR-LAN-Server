@@ -1,0 +1,58 @@
+; GBFR LAN - annotated example configuration.
+;
+; The game reads a file named `lan.ini` next to the game exe; `install.ps1` already
+; copies a ready-to-use one. This file is the documented reference copy - it is NOT
+; read by anything. Edit `lan.ini`, not this file.
+;
+; Quick setups:
+;   * Same PC / Nucleus Co-op - keep the defaults (host = 127.0.0.1).
+;   * Two PCs on a LAN        - on every client set [server] host to the host PC's
+;                               LAN IP (e.g. 192.168.1.10). The host itself keeps
+;                               127.0.0.1. Both PCs need the shims installed and
+;                               open_firewall.ps1 run as Administrator.
+;   * VPN / virtual LAN       - set [server] host to the broker's VPN IP and, if the
+;                               mesh advertises the wrong address, set [party]
+;                               advertise_ip to this PC's VPN IP.
+;
+; Ports (host PC): TCP 8080 HTTP, TCP 8081 WebSocket, UDP 27015 Party mesh (per PC).
+; Environment overrides: GBFR_LAN_STUB=host:port replaces [server], GBFR_LAN_INI=<path>
+; selects a different ini file.
+
+[server]
+; Broker address. 127.0.0.1 for same-PC/Nucleus; the host PC's LAN or VPN IP otherwise.
+host = 127.0.0.1
+
+; Broker HTTP port (TCP). Must match the server process (--http-port).
+port = 8080
+
+; Cygames WebSocket port (TCP). Must match the server process (--ws-port).
+ws_port = 8081
+
+[lobby]
+; Hard cap per lobby and per /party/join. 2-32.
+max_players = 8
+
+; true  = ignore the game's create MaxPlayers and use max_players above
+;         (the shipping build sends 4, so this is how you get more than 4).
+; false = honor the create body (the Party shim still tracks at most 8 remotes).
+override_game_max = true
+
+[party]
+; UDP port for the Party mesh on THIS PC. 0 = random high port.
+; 27015 is easier to allow through Windows Firewall. If the port is busy (e.g. a
+; second Nucleus instance), the shim falls back to a random port and peers learn it
+; from the broker - no configuration needed.
+udp_port = 27015
+
+; IPv4 this PC advertises to peers. Blank = auto-detect (the NIC used to reach the
+; broker, then a UDP connect probe). Set it when auto-detect picks the wrong NIC,
+; typically on a VPN:
+;   advertise_ip = 100.101.102.103
+advertise_ip =
+
+[debug]
+; Verbose logging for troubleshooting: per-message Party traffic, payload hex samples,
+; quest/queue probes, and one line per broker request.
+; false = lifecycle, lobby/quest transitions and errors only (recommended for normal play).
+; GBFR_LAN_DEBUG=1 overrides this for a single process.
+enabled = false

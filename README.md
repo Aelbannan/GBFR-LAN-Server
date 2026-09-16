@@ -21,10 +21,9 @@ on one PC.
 
 ## Documentation
 
-Maintainer reference in [`docs/`](docs/): architecture and broker endpoints
-(`docs/architecture.md`), the Party transport and reliability layer
-(`docs/party-transport.md`), the game-side contract and reverse-engineering notes
-(`docs/game-integration.md`), and the genuine-SDK fidelity notes (`docs/sdk-fidelity.md`).
+Maintainer reference in [`docs/`](docs/README.md): architecture and broker endpoints,
+Party transport and reliability, the game-side contract, game traffic details, diagnostics,
+Nucleus/multi-instance notes, genuine-SDK fidelity, and a patch-recovery guide.
 
 ## Components
 
@@ -125,6 +124,10 @@ advertise_ip =           ; blank = auto-detect; set this PC's LAN IP if needed
 Same PC / Nucleus instances: keep `127.0.0.1`. The `GBFR_LAN_STUB=host:port` environment
 variable overrides `[server]` for one process.
 
+The default log profile is lifecycle, transitions and errors only. `[debug] enabled = true`
+(or `GBFR_LAN_DEBUG=1` for one process) adds the verbose tiers: per-message Party traffic,
+payload hex samples, quest/queue probes, and one line per broker request.
+
 ## Run
 
 1. On the host PC, run `<game>\gbfr-lan-server.exe` (or `lan-server\gbfr-lan-server.exe`
@@ -155,13 +158,15 @@ Logs are written next to the game exe:
   `playfab_mp_shim.log` and the server log.
 - **Lobby created but guests see nothing / cannot join:** check `[server] host`, Windows
   Firewall, and `[lobby] max_players`.
-- **Quest starts then hangs:** compare both `party_shim.log` files. Every send/recv is
-  logged as `opcode=` + `len=`; after quest start both clients should show opcode `2`
-  (type 21 on receive). Set `GBFR_PARTY_LOG_HEX=1` for full payload hex dumps.
+- **Quest starts then hangs:** compare both `party_shim.log` files. With `[debug] enabled`
+  (or `GBFR_LAN_DEBUG=1`) every send/recv is logged as `opcode=` + `len=`; after quest start
+  both clients should show opcode `2` (type 21 on receive). `GBFR_PARTY_LOG_HEX=1` forces
+  full payload hex dumps.
 - **A game update broke something:** parts of the shims patch the exe or track offsets,
   so updates can break them. The shim logs show the first step that failed.
 
 Debug environment variables: `GBFR_LAN_STUB=host:port` (override server),
+`GBFR_LAN_DEBUG=1` (verbose logging for one process, same as `[debug] enabled`),
 `GBFR_PARTY_LOG_HEX=1` (hex dump Party payloads), `GBFR_PARTY_FORCE_INLINE=1` (disable
 Party worker threads), `GBFR_LAN_INI=<path>` (server's ini path).
 
