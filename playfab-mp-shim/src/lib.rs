@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 include!("../../common/lan_cfg.rs");
@@ -957,6 +957,9 @@ struct Mp {
     title: CString,
     token: Option<CString>,
     entity: Option<EntityKey>,
+    /// Instance counter, incremented by PFMultiplayerInitialize. Broker jobs snapshot it so a
+    /// completion from a previous initialize/uninitialize pair can never mutate this instance.
+    generation: u64,
     lobbies: Vec<*mut Lobby>,
     pending: VecDeque<*mut u8>,
     in_flight: Vec<*mut u8>,
@@ -965,7 +968,6 @@ struct Mp {
     /// library-allocated and the changes as valid until Finish, so nothing may rebuild or clear it
     /// in the meantime — a Start arriving before Finish must re-return the same array unchanged.
     batch_outstanding: bool,
-    last_poll: Instant,
     pending_joins: Vec<PendingJoin>,
     /// CHANGE 1b: last emitted Start/Finish state tuples, so unchanged pumps are not formatted.
     start_state: StateLog,
@@ -987,6 +989,127 @@ unsafe impl Send for PendingJoin {}
 unsafe impl Sync for PendingJoin {}
 unsafe impl Send for Mp {}
 unsafe impl Sync for Mp {}
+
+// ---------------------------------------------------------------------------
+// Async broker worker (AUDIT_PLAYFAB PF-06).
+//
+// The genuine PlayFabMultiplayerWin.dll never touches the network from a public entry point:
+// every create/join/find/update/leave starts an async operation, the I/O runs on a worker, and
+// the title learns the result only through the state-change queue. The shim used to do the HTTP
+// inline on the game's tick thread, which froze the tick for up to connect(1s)+read(3s) per call
+// against a slow broker, and made PFMultiplayerStartProcessing issue one GetLobby POST per lobby
+// every 250 ms under the global lock.
+//
+// This worker restores the genuine shape:
+//   * exports snapshot the caller's arguments and fully build the request body on the caller's
+//     thread (pure CPU, no I/O), then enqueue a job and return S_OK;
+//   * the worker performs the HTTP without holding the shim lock;
+//   * results are applied under the lock and completions are queued in the documented order
+//     (MemberAdded -> Updated -> *Completed);
+//   * PFMultiplayerStartProcessing only drains the queue and never blocks.
+//
+// Jobs carry the instance generation so a completion from a previous initialize/uninitialize
+// pair can never mutate the next instance's state.
+// ---------------------------------------------------------------------------
+
+const BROKER_POLL_MS: u64 = 250;
+const BROKER_WAIT_MS: u64 = 25;
+
+enum BrokerJob {
+    Create(CreateJob),
+    Join(JoinJob),
+    Find(FindJob),
+    Leave(LeaveJob),
+    PostUpdate(PostJob),
+}
+
+struct CreateJob {
+    generation: u64,
+    body: String,
+    owner: EntityKey,
+    lobby: *mut Lobby,
+    async_ctx: *mut c_void,
+    max_players: u32,
+    lobby_data: HashMap<String, String>,
+    search: HashMap<String, String>,
+}
+
+struct JoinJob {
+    generation: u64,
+    body: String,
+    joiner: EntityKey,
+    member_kv: HashMap<String, String>,
+    lobby: *mut Lobby,
+    async_ctx: *mut c_void,
+}
+
+struct FindJob {
+    generation: u64,
+    body: String,
+    entity: EntityKey,
+    async_ctx: *mut c_void,
+}
+
+struct LeaveJob {
+    generation: u64,
+    body: String,
+    lobby: *mut Lobby,
+}
+
+struct PostJob {
+    generation: u64,
+    body: String,
+    lobby: *mut Lobby,
+    member: Option<EntityKey>,
+    async_ctx: *mut c_void,
+    delta: LobbyDelta,
+}
+
+// The jobs move `*mut Lobby` handles between the exporting thread and the worker; every access
+// is serialized by the G mutex (or happens before the handle is published), and lobbies are
+// leaked for the process lifetime, so the raw handle is valid for the whole job.
+unsafe impl Send for BrokerJob {}
+
+struct BrokerQ {
+    q: Mutex<VecDeque<BrokerJob>>,
+    cv: Condvar,
+}
+
+static BROKER_Q: OnceLock<BrokerQ> = OnceLock::new();
+static BROKER_STARTED: AtomicBool = AtomicBool::new(false);
+/// Incremented on every PFMultiplayerInitialize; copied into Mp and every job.
+static INSTANCE_GEN: AtomicU64 = AtomicU64::new(0);
+
+fn broker_queue() -> &'static BrokerQ {
+    BROKER_Q.get_or_init(|| BrokerQ {
+        q: Mutex::new(VecDeque::new()),
+        cv: Condvar::new(),
+    })
+}
+
+fn ensure_broker_thread() {
+    if BROKER_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("pfbroker".into())
+        .spawn(broker_thread_main);
+}
+
+fn enqueue_job(job: BrokerJob) {
+    ensure_broker_thread();
+    let q = broker_queue();
+    q.q.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back(job);
+    q.cv.notify_one();
+}
+
+/// Current instance generation, or 0 when no instance is live. Callers snapshot this while
+/// building a job.
+fn current_generation() -> u64 {
+    with_mp(|m| m.generation, 0)
+}
 
 static G: OnceLock<Mutex<Option<Box<Mp>>>> = OnceLock::new();
 static ERR: OnceLock<CString> = OnceLock::new();
@@ -1252,14 +1375,16 @@ fn lobby_from_json(text: &str) -> Option<Box<Lobby>> {
     }))
 }
 
-fn post_create(
+/// Build the CreateAndJoinLobby request body. Pure CPU: runs on the caller's thread so the
+/// worker never reads game memory.
+fn build_create_body(
     max: u32,
     owner_migration_policy: u32,
     lobby_data: &HashMap<String, String>,
     search: &HashMap<String, String>,
     owner_id: &str,
     member_kv: &HashMap<String, String>,
-) -> Result<Box<Lobby>, i32> {
+) -> String {
     let mut ld = String::from("{");
     for (i, (k, v)) in lobby_data.iter().enumerate() {
         if i > 0 {
@@ -1285,45 +1410,9 @@ fn post_create(
         )
     };
     let md = member_data_json(owner_id, member_kv);
-    let body = format!(
+    format!(
         "{{\"MaxPlayers\":{max},\"OwnerMigrationPolicy\":{owner_migration_policy},\"LobbyData\":{ld},\"SearchData\":{sd}{owner},\"MemberData\":{md}}}"
-    );
-    let (status, text) = http_json_status("POST", "/Lobby/CreateAndJoinLobby", &body)
-        .ok_or(E_PF_SERVICE_UNEXPECTED)?;
-    if status != 200 {
-        log_line(&format!(
-            "CreateAndJoinLobby REJECTED status={status} body={}",
-            truncate_log(&text, 300)
-        ));
-        return Err(broker_error_code(status, &text));
-    }
-    let id = json_str(&text, "LobbyId").ok_or(E_PF_SERVICE_MALFORMED_RESPONSE)?;
-    let conn = json_str(&text, "ConnectionString").unwrap_or_else(|| format!("lan.{id}"));
-    let resolved_max = json_max_players(&text).max(max);
-    let mut props = HashMap::new();
-    apply_props(&mut props, lobby_data.clone());
-    let mut sch = HashMap::new();
-    apply_props(&mut sch, search.clone());
-    Ok(Box::new(Lobby {
-        id: CString::new(id).map_err(|_| E_PF_SERVICE_MALFORMED_RESPONSE)?,
-        connection: CString::new(conn).map_err(|_| E_PF_SERVICE_MALFORMED_RESPONSE)?,
-        owner: EntityKey {
-            id: intern(if owner_id.is_empty() { "lan-user" } else { owner_id }),
-            type_: intern("title_player_account"),
-        },
-        has_owner: !owner_id.is_empty(),
-        max_players: resolved_max,
-        props,
-        search: sch,
-        member_props: HashMap::new(),
-        members: Vec::new(),
-        membership_lock: 0,
-        access_policy: 0,
-        lock_known: false,
-        announced: HashSet::new(),
-        pending: false,
-        left: false,
-    }))
+    )
 }
 
 fn is_real_network_descriptor(s: &str) -> bool {
@@ -1531,24 +1620,13 @@ unsafe fn emit_join_completed(m: &mut Mp, lobby: *mut Lobby, joiner: EntityKey, 
     }
     // Guaranteed before JoinLobbyCompleted: the membership lock is populated here.
     emit_updated(m, lobby, delta, true);
-    let sc = alloc_sc(0x28, 1);
-    if sc.is_null() {
-        return;
-    }
-    ptr::write_unaligned(sc.add(4) as *mut i32, 0);
-    // PlayFabReadLobbyProperties: +8 is joiner entity-id C string, +0x20 is lobby handle
-    ptr::write_unaligned(sc.add(8) as *mut *const c_char, joiner.id);
-    ptr::write_unaligned(sc.add(0x20) as *mut *mut Lobby, lobby);
-    let _ = async_ctx;
-    queue(m, sc);
+    queue_join_completed(m, lobby, joiner, async_ctx, 0);
     debug_log("JoinLobbyCompleted type1 lobby@+0x20");
 }
 
-fn post_join(
-    conn: &str,
-    joiner_id: &str,
-    member_kv: &HashMap<String, String>,
-) -> Result<Box<Lobby>, i32> {
+/// Build the JoinLobby request body. The response handling (and the second GetLobby hop) lives
+/// in the broker worker.
+fn build_join_body(conn: &str, joiner_id: &str, member_kv: &HashMap<String, String>) -> String {
     let member = if joiner_id.is_empty() {
         String::new()
     } else {
@@ -1558,49 +1636,10 @@ fn post_join(
             member_data_json(joiner_id, member_kv)
         )
     };
-    let body = format!(
+    format!(
         "{{\"ConnectionString\":\"{}\"{member}}}",
         json_escape(conn)
-    );
-    let (status, text) = http_json_status("POST", "/Lobby/JoinLobby", &body)
-        .ok_or(E_PF_SERVICE_UNEXPECTED)?;
-    if status != 200 {
-        log_line(&format!(
-            "JoinLobby REJECTED conn={conn} status={status} body={}",
-            truncate_log(&text, 300)
-        ));
-        return Err(broker_error_code(status, &text));
-    }
-    let id = json_str(&text, "LobbyId").ok_or(E_PF_SERVICE_MALFORMED_RESPONSE)?;
-    let (gstatus, got) = http_json_status("POST", "/Lobby/GetLobby", &format!("{{\"LobbyId\":\"{id}\"}}"))
-        .ok_or(E_PF_SERVICE_UNEXPECTED)?;
-    if gstatus != 200 {
-        return Err(broker_error_code(gstatus, &got));
-    }
-    if let Some(mut l) = lobby_from_json(&got) {
-        l.pending = true;
-        return Ok(l);
-    }
-    Ok(Box::new(Lobby {
-            id: CString::new(id.clone()).map_err(|_| E_PF_SERVICE_MALFORMED_RESPONSE)?,
-            connection: CString::new(conn).map_err(|_| E_PF_SERVICE_MALFORMED_RESPONSE)?,
-            owner: EntityKey {
-                id: intern("owner"),
-                type_: intern("title_player_account"),
-            },
-            has_owner: true,
-            max_players: json_max_players(&got),
-            props: HashMap::new(),
-            search: HashMap::new(),
-            member_props: HashMap::new(),
-            members: Vec::new(),
-            membership_lock: 0,
-            access_policy: 0,
-            lock_known: false,
-            announced: HashSet::new(),
-            pending: true,
-            left: false,
-        }))
+    )
 }
 
 fn member_props_json_for(lobby: &Lobby, eid: &str) -> Option<String> {
@@ -1623,14 +1662,16 @@ struct PostUpdateScalars {
     membership_lock: Option<i32>,
 }
 
-fn post_update(
+/// Build the UpdateLobby request body from the lobby's already-applied local view. Pure CPU;
+/// the broker POST happens on the worker.
+fn build_update_body(
     lobby: &Lobby,
     search_delete: &[String],
     lobby_delete: &[String],
     member_target: Option<&str>,
     member_delete: &[String],
     scalars: &PostUpdateScalars,
-) -> bool {
+) -> String {
     let mut ld = String::from("{");
     for (i, (k, v)) in lobby.props.iter().enumerate() {
         if i > 0 {
@@ -1719,28 +1760,10 @@ fn post_update(
             q_str_list(member_delete)
         ));
     }
-    let body = format!(
+    format!(
         "{{\"LobbyId\":\"{}\",\"LobbyData\":{ld},\"SearchData\":{sd}{md}{extras}}}",
         lobby.id.to_string_lossy()
-    );
-    match http_json_status("POST", "/Lobby/UpdateLobby", &body) {
-        Some((200, _)) => true,
-        Some((status, resp)) => {
-            log_line(&format!(
-                "UpdateLobby REJECTED id={} status={status} body={}",
-                lobby.id.to_string_lossy(),
-                truncate_log(&resp, 200)
-            ));
-            false
-        }
-        None => {
-            log_line(&format!(
-                "UpdateLobby no broker response id={}",
-                lobby.id.to_string_lossy()
-            ));
-            false
-        }
-    }
+    )
 }
 
 /// Snapshot of the fields an Updated diffs. Cheap shallow clones of the small maps.
@@ -1822,17 +1845,22 @@ unsafe fn diff_lobby(before: &LobbySnapshot, after: &Lobby) -> LobbyDelta {
     d
 }
 
-fn refresh_lobby(lobby: &mut Lobby) -> (Vec<String>, bool, LobbyDelta) {
+/// Apply one GetLobby result to a lobby. HTTP-free so it is safe to call under the shim lock:
+/// `poll_all_lobbies` performs the I/O on the broker worker. `None` means no usable response at
+/// all (transient, not terminal).
+fn apply_refresh(
+    lobby: &mut Lobby,
+    resp: Option<(u16, String)>,
+) -> (Vec<String>, bool, LobbyDelta) {
     // Entity ids that were announced (type 2) and are no longer in the refreshed roster. PF-02: the
     // exe has a live MemberRemoved (type 4) handler, but we never emitted one, so a player who left
     // stayed visible in the other peer's session forever.
     let mut departed: Vec<String> = Vec::new();
     let mut delta = LobbyDelta::default();
-    let body = format!("{{\"LobbyId\":\"{}\"}}", lobby.id.to_string_lossy());
     // PF-03: a definitive "no such lobby" is terminal. The exe's type-10 (Disconnected) handler
     // reads lobby@+8, calls PFLobbyGetLobbyId and clears ctx+0x1d0 — i.e. it is the state change
     // that makes the game accept the lobby is gone. A mere no-response is transient, not terminal.
-    let (status, text) = match http_json_status("POST", "/Lobby/GetLobby", &body) {
+    let (status, text) = match resp {
         Some(v) => v,
         None => return (departed, false, delta),
     };
@@ -1892,6 +1920,586 @@ fn refresh_lobby(lobby: &mut Lobby) -> (Vec<String>, bool, LobbyDelta) {
     (departed, false, delta)
 }
 
+// ---------------------------------------------------------------------------
+// Broker jobs and the worker loop.
+// ---------------------------------------------------------------------------
+
+unsafe fn queue_create_completed(
+    m: &mut Mp,
+    lobby: *mut Lobby,
+    async_ctx: *mut c_void,
+    code: i32,
+) {
+    let sc = alloc_sc(0x20, 0);
+    if sc.is_null() {
+        return;
+    }
+    ptr::write_unaligned(sc.add(4) as *mut i32, code);
+    ptr::write_unaligned(sc.add(8) as *mut *mut c_void, async_ctx);
+    ptr::write_unaligned(sc.add(0x10) as *mut *mut Lobby, lobby);
+    queue(m, sc);
+}
+
+unsafe fn queue_join_completed(
+    m: &mut Mp,
+    lobby: *mut Lobby,
+    joiner: EntityKey,
+    async_ctx: *mut c_void,
+    code: i32,
+) {
+    let sc = alloc_sc(0x28, 1);
+    if sc.is_null() {
+        return;
+    }
+    ptr::write_unaligned(sc.add(4) as *mut i32, code);
+    // PlayFabReadLobbyProperties: +8 is joiner entity-id C string, +0x20 is lobby handle
+    ptr::write_unaligned(sc.add(8) as *mut *const c_char, joiner.id);
+    ptr::write_unaligned(sc.add(0x20) as *mut *mut Lobby, lobby);
+    let _ = async_ctx;
+    queue(m, sc);
+}
+
+/// A lobby handle published before the service has answered. Identity getters answer
+/// E_PF_OBJECT_STILL_PENDING until the completion sets `pending = false`.
+fn new_placeholder(owner: EntityKey, max_players: u32, access_policy: u32) -> Box<Lobby> {
+    Box::new(Lobby {
+        id: CString::new("").unwrap(),
+        connection: CString::new("").unwrap(),
+        owner,
+        has_owner: true,
+        max_players,
+        props: HashMap::new(),
+        search: HashMap::new(),
+        member_props: HashMap::new(),
+        members: Vec::new(),
+        membership_lock: 0,
+        access_policy,
+        lock_known: false,
+        announced: HashSet::new(),
+        pending: true,
+        left: false,
+    })
+}
+
+/// Copy a lobby built by `lobby_from_json` into an already-published placeholder handle. The game
+/// holds the handle pointer, so the object cannot be replaced; only its fields move. Bookkeeping
+/// owned by the completion path (`announced`, `lock_known`, `pending`) is deliberately preserved.
+fn move_lobby_into(dst: *mut Lobby, fresh: Box<Lobby>) {
+    let fresh = *fresh;
+    let d = unsafe { &mut *dst };
+    d.id = fresh.id;
+    d.connection = fresh.connection;
+    d.owner = fresh.owner;
+    d.has_owner = fresh.has_owner;
+    d.max_players = fresh.max_players;
+    d.props = fresh.props;
+    d.search = fresh.search;
+    d.member_props = fresh.member_props;
+    d.members = fresh.members;
+    d.membership_lock = fresh.membership_lock;
+    d.access_policy = fresh.access_policy;
+}
+
+fn ensure_cstr_map(m: &HashMap<String, String>) -> HashMap<String, CString> {
+    m.iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                CString::new(v.as_str()).unwrap_or_else(|_| CString::new("").unwrap()),
+            )
+        })
+        .collect()
+}
+
+/// Fill a create placeholder from the service response. The request carried the property bags,
+/// so they are rebuilt locally (the broker's create reply is only id/connection/max).
+fn apply_create_response(
+    lp: *mut Lobby,
+    text: &str,
+    owner: EntityKey,
+    max_players: u32,
+    lobby_data: &HashMap<String, String>,
+    search: &HashMap<String, String>,
+) {
+    let d = unsafe { &mut *lp };
+    if let Some(id) = json_str(text, "LobbyId") {
+        d.id = CString::new(id).unwrap_or_else(|_| CString::new("").unwrap());
+    }
+    if let Some(conn) = json_str(text, "ConnectionString") {
+        d.connection = CString::new(conn).unwrap_or_else(|_| CString::new("").unwrap());
+    }
+    d.owner = owner;
+    d.has_owner = true;
+    d.max_players = json_max_players(text).max(max_players);
+    d.props = ensure_cstr_map(lobby_data);
+    d.search = ensure_cstr_map(search);
+    d.pending = false;
+}
+
+/// Fill a join placeholder from the GetLobby response and seed the joiner's own member data.
+unsafe fn apply_join_response(
+    lp: *mut Lobby,
+    text: &str,
+    joiner: EntityKey,
+    member_kv: &HashMap<String, String>,
+) {
+    if let Some(fresh) = lobby_from_json(text) {
+        move_lobby_into(lp, fresh);
+    }
+    let mid = read_cstr(joiner.id);
+    let d = &mut *lp;
+    if !d.members.iter().any(|m| read_cstr(m.id) == mid) {
+        d.members.push(joiner);
+    }
+    let entry = d.member_props.entry(mid.clone()).or_insert_with(HashMap::new);
+    apply_props(entry, member_kv.clone());
+    ensure_member_props(entry, &mid);
+}
+
+/// Apply one GetLobby result to a lobby and queue the resulting changes. Runs under the lock.
+unsafe fn poll_lobby(m: &mut Mp, lp: *mut Lobby, resp: Option<(u16, String)>) {
+    let (departed, gone, delta) = apply_refresh(&mut *lp, resp);
+    for eid in departed {
+        // PFLobbyMemberRemovedStateChange: result@+4, lobby@+8, member@+0x10, reason@+0x20.
+        // Exe handler 0x143B48360 reads +8 and +0x10 (verified).
+        let sc = alloc_sc(0x28, 4);
+        if sc.is_null() {
+            break;
+        }
+        ptr::write_unaligned(sc.add(4) as *mut i32, 0);
+        ptr::write_unaligned(sc.add(8) as *mut *mut Lobby, lp);
+        let ek = EntityKey {
+            id: intern(&eid),
+            type_: intern("title_player_account"),
+        };
+        ptr::write_unaligned(sc.add(0x10) as *mut EntityKey, ek);
+        ptr::write_unaligned(sc.add(0x20) as *mut u32, 0);
+        queue(m, sc);
+        // Allow a later re-join to be announced again.
+        (*lp).announced.remove(&eid);
+        debug_log(&format!("MemberRemoved entity={eid}"));
+    }
+    // PF-03 re-fix: `apply_refresh` returns gone=true from its early non-200 return, which carries
+    // no delta — so gating this on a change made the emission unreachable (ORDINAL_CHAIN_AUDIT
+    // OC-5). Emit on `gone` itself; the retain below guarantees it fires at most once per lobby.
+    if gone {
+        // PFLobbyDisconnectedStateChange: lobby@+8 (the exe's handler reads only this, then
+        // clears its cached PFLobbyHandle at ctx+0x1d0).
+        (*lp).left = true;
+        let sc = alloc_sc(0x18, 10);
+        if !sc.is_null() {
+            ptr::write_unaligned(sc.add(4) as *mut i32, 0);
+            ptr::write_unaligned(sc.add(8) as *mut *mut Lobby, lp);
+            queue(m, sc);
+        }
+        m.lobbies.retain(|p| *p != lp);
+        log_line(&format!(
+            "LobbyDisconnected id={} (broker returned non-200); queued type 10, stopped polling",
+            (*lp).id.to_string_lossy()
+        ));
+        return;
+    }
+    let pending = m
+        .pending_joins
+        .iter()
+        .any(|pj| pj.lobby == lp && !pj.emitted);
+    // While a join is pending, the join-completion path owns the delivery order
+    // (MemberAdded -> Updated -> JoinLobbyCompleted); the poll must not race a type-7 in front of
+    // it. A disconnected lobby gets its type-10 instead of an Updated.
+    if !pending {
+        announce_lobby_members(m, lp);
+        emit_updated(m, lp, delta, false);
+    }
+}
+
+/// Emit any parked join whose host lobby now has a real network descriptor.
+unsafe fn service_pending_joins(m: &mut Mp) {
+    let ready: Vec<usize> = m
+        .pending_joins
+        .iter()
+        .enumerate()
+        .filter(|(_, pj)| !pj.emitted && lobby_ready_for_guest(&*pj.lobby))
+        .map(|(i, _)| i)
+        .collect();
+    for i in ready.into_iter().rev() {
+        let pj = m.pending_joins.remove(i);
+        emit_join_completed(m, pj.lobby, pj.joiner, pj.async_ctx);
+    }
+}
+
+/// One GetLobby round per tracked lobby. This replaces the old 250 ms refresh that ran inside
+/// PFMultiplayerStartProcessing on the game's tick thread.
+fn poll_all_lobbies() {
+    let targets: Vec<(*mut Lobby, String)> = with_mp(
+        |m| {
+            m.lobbies
+                .iter()
+                .filter_map(|&lp| {
+                    let l = unsafe { &*lp };
+                    // A parked join is still `pending` but must be polled: that is how the
+                    // host's network_descriptor is discovered and the join completed. Only a
+                    // create that has not answered yet (no service id) has nothing to poll.
+                    if l.left || (l.pending && l.id.to_bytes().is_empty()) {
+                        return None;
+                    }
+                    Some((lp, l.id.to_string_lossy().into_owned()))
+                })
+                .collect()
+        },
+        Vec::new(),
+    );
+    for (lp, id) in targets {
+        let resp = http_json_status("POST", "/Lobby/GetLobby", &format!("{{\"LobbyId\":\"{id}\"}}"));
+        with_mp(
+            |m| {
+                if m.lobbies.iter().all(|p| *p != lp) {
+                    return;
+                }
+                unsafe {
+                    if (*lp).left || ((*lp).pending && (*lp).id.to_bytes().is_empty()) {
+                        return;
+                    }
+                    poll_lobby(m, lp, resp);
+                }
+            },
+            (),
+        );
+    }
+    with_mp(|m| unsafe { service_pending_joins(m) }, ());
+}
+
+fn run_create(job: CreateJob) {
+    let (status, text) = http_json_status("POST", "/Lobby/CreateAndJoinLobby", &job.body)
+        .unwrap_or((0, String::new()));
+    with_mp(
+        |m| {
+            if m.generation != job.generation {
+                return;
+            }
+            unsafe {
+                let lp = job.lobby;
+                if (*lp).left {
+                    return;
+                }
+                if status != 200 || json_str(&text, "LobbyId").is_none() {
+                    let code = if status != 200 {
+                        broker_error_code(status, &text)
+                    } else {
+                        E_PF_SERVICE_MALFORMED_RESPONSE
+                    };
+                    log_line(&format!(
+                        "CreateAndJoinLobby REJECTED status={status} code=0x{code:08X} body={}",
+                        truncate_log(&text, 300)
+                    ));
+                    (*lp).pending = false;
+                    (*lp).left = true;
+                    m.lobbies.retain(|p| *p != lp);
+                    queue_create_completed(m, lp, job.async_ctx, code);
+                    return;
+                }
+                apply_create_response(
+                    lp,
+                    &text,
+                    job.owner,
+                    job.max_players,
+                    &job.lobby_data,
+                    &job.search,
+                );
+                // Documented order (PFMultiplayerCreateAndJoinLobby): MemberAdded, then
+                // CreateAndJoinLobbyCompleted. MemberAdded seeds the exe's cached handle.
+                emit_member_added(m, lp, job.owner);
+                queue_create_completed(m, lp, job.async_ctx, 0);
+            }
+        },
+        (),
+    );
+}
+
+fn fail_join(job: &JoinJob, code: i32, status: u16, text: &str) {
+    log_line(&format!(
+        "JoinLobby REJECTED status={status} code=0x{code:08X} body={}",
+        truncate_log(text, 300)
+    ));
+    with_mp(
+        |m| {
+            if m.generation != job.generation {
+                return;
+            }
+            unsafe {
+                (*(job.lobby)).pending = false;
+                (*(job.lobby)).left = true;
+                m.lobbies.retain(|p| *p != job.lobby);
+                queue_join_completed(m, job.lobby, job.joiner, job.async_ctx, code);
+            }
+        },
+        (),
+    );
+}
+
+fn run_join(job: JoinJob) {
+    let (status, text) = http_json_status("POST", "/Lobby/JoinLobby", &job.body)
+        .unwrap_or((0, String::new()));
+    if status != 200 {
+        fail_join(&job, broker_error_code(status, &text), status, &text);
+        return;
+    }
+    let Some(id) = json_str(&text, "LobbyId") else {
+        fail_join(&job, E_PF_SERVICE_MALFORMED_RESPONSE, status, &text);
+        return;
+    };
+    let (gstatus, got) = http_json_status("POST", "/Lobby/GetLobby", &format!("{{\"LobbyId\":\"{id}\"}}"))
+        .unwrap_or((0, String::new()));
+    if gstatus != 200 {
+        fail_join(&job, broker_error_code(gstatus, &got), gstatus, &got);
+        return;
+    }
+    with_mp(
+        |m| {
+            if m.generation != job.generation {
+                return;
+            }
+            unsafe {
+                let lp = job.lobby;
+                if (*lp).left {
+                    return;
+                }
+                apply_join_response(lp, &got, job.joiner, &job.member_kv);
+                debug_log(&format!(
+                    "JoinLobby lobby id={} search_keys=[{}] lobby_keys=[{}]",
+                    (*lp).id.to_string_lossy(),
+                    map_preview(&(*lp).search, 500),
+                    map_preview(&(*lp).props, 300)
+                ));
+                if lobby_ready_for_guest(&*lp) {
+                    emit_join_completed(m, lp, job.joiner, job.async_ctx);
+                } else {
+                    debug_log("JoinLobby waiting for network_descriptor");
+                    m.pending_joins.push(PendingJoin {
+                        lobby: lp,
+                        joiner: job.joiner,
+                        async_ctx: job.async_ctx,
+                        emitted: false,
+                    });
+                }
+            }
+        },
+        (),
+    );
+}
+
+fn run_find(job: FindJob) {
+    let (status, text) = http_json_status("POST", "/Lobby/FindLobbies", &job.body)
+        .unwrap_or((0, String::new()));
+    let rows: Vec<String> = if status == 200 {
+        json_arr_objects(&text, "Lobbies")
+            .into_iter()
+            .filter(|row| find_row_live(row))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // The genuine FindLobbies is asynchronous: it returns S_OK and reports the service failure in
+    // FindLobbiesCompleted.result. Keep that shape instead of faking a zero-result success.
+    let result_code = if status == 200 {
+        0
+    } else {
+        broker_error_code(status, &text)
+    };
+    debug_log(&format!("FindLobbies n={}", rows.len()));
+    for row in rows.iter().take(4) {
+        let sd = json_obj(row, "SearchData");
+        let mut keys: Vec<String> = sd
+            .iter()
+            .map(|(k, v)| format!("{k}={}", preview_str(v, 48)))
+            .collect();
+        keys.sort();
+        debug_log(&format!(
+            "FindLobbies row {} search=[{}]",
+            json_str(row, "LobbyId").unwrap_or_default(),
+            preview_str(&keys.join(", "), 500)
+        ));
+    }
+    with_mp(
+        |m| {
+            if m.generation != job.generation {
+                return;
+            }
+            unsafe {
+                let n = rows.len().min(16);
+                let results = if n == 0 {
+                    ptr::null_mut()
+                } else {
+                    let layout = std::alloc::Layout::array::<SearchResult>(n).unwrap();
+                    std::alloc::alloc_zeroed(layout) as *mut SearchResult
+                };
+                for (i, row) in rows.iter().take(n).enumerate() {
+                    let id = json_str(row, "LobbyId").unwrap_or_default();
+                    let conn = json_str(row, "ConnectionString").unwrap_or_default();
+                    let max_member = json_max_players(row);
+                    let cur: u32 = json_str(row, "CurrentPlayers")
+                        .and_then(|s| s.parse().ok())
+                        .or_else(|| {
+                            row.split("\"CurrentPlayers\":")
+                                .nth(1)
+                                .and_then(|s| {
+                                    s.chars()
+                                        .take_while(|c| c.is_ascii_digit())
+                                        .collect::<String>()
+                                        .parse()
+                                        .ok()
+                                })
+                        })
+                        .unwrap_or(1)
+                        .clamp(1, max_member);
+                    let search = json_obj(row, "SearchData");
+                    let (search_count, search_keys, search_vals) = intern_kv_arrays(&search);
+                    let r = SearchResult {
+                        lobby_id: intern(&id),
+                        connection: intern(&conn),
+                        owner: intern_owner_key(row),
+                        max_member,
+                        current_member: cur,
+                        search_count,
+                        _pad0: 0,
+                        search_keys,
+                        search_vals,
+                        friend_count: 0,
+                        _pad1: 0,
+                        friends: ptr::null(),
+                        membership_lock: 0,
+                        _pad2: 0,
+                    };
+                    ptr::write(results.add(i), r);
+                }
+                let sc = alloc_sc(0x38, 12);
+                if !sc.is_null() {
+                    ptr::write_unaligned(sc.add(4) as *mut i32, result_code);
+                    ptr::write_unaligned(sc.add(8) as *mut EntityKey, job.entity);
+                    ptr::write_unaligned(sc.add(0x18) as *mut *mut c_void, job.async_ctx);
+                    ptr::write_unaligned(sc.add(0x20) as *mut u32, n as u32);
+                    ptr::write_unaligned(sc.add(0x28) as *mut *mut SearchResult, results);
+                    queue(m, sc);
+                }
+            }
+        },
+        (),
+    );
+}
+
+fn run_leave(job: LeaveJob) {
+    let (status, text) = http_json_status("POST", "/Lobby/LeaveLobby", &job.body)
+        .unwrap_or((0, String::new()));
+    let code = if status == 200 {
+        0
+    } else {
+        broker_error_code(status, &text)
+    };
+    if code != 0 {
+        log_line(&format!(
+            "LeaveLobby REJECTED status={status} code=0x{code:08X} body={}",
+            truncate_log(&text, 200)
+        ));
+    }
+    with_mp(
+        |m| {
+            if m.generation != job.generation {
+                return;
+            }
+            unsafe {
+                let sc = alloc_sc(0x18, 6);
+                if !sc.is_null() {
+                    ptr::write_unaligned(sc.add(4) as *mut i32, code);
+                    queue(m, sc);
+                }
+                let _ = job.lobby;
+            }
+        },
+        (),
+    );
+}
+
+fn run_post(job: PostJob) {
+    let (status, text) = http_json_status("POST", "/Lobby/UpdateLobby", &job.body)
+        .unwrap_or((0, String::new()));
+    let code = if status == 200 {
+        0
+    } else {
+        broker_error_code(status, &text)
+    };
+    if code != 0 {
+        log_line(&format!(
+            "UpdateLobby REJECTED id={} status={status} code=0x{code:08X} body={}",
+            unsafe { (*job.lobby).id.to_string_lossy() },
+            truncate_log(&text, 200)
+        ));
+    }
+    with_mp(
+        |m| {
+            if m.generation != job.generation {
+                return;
+            }
+            unsafe {
+                // PFLobbyPostUpdateCompletedStateChange is 0x28: result@+4, lobby@+8,
+                // localUser@+0x10, asyncContext@+0x20. The exe currently reads only result@+4.
+                let sc = alloc_sc(0x28, 8);
+                if !sc.is_null() {
+                    ptr::write_unaligned(sc.add(4) as *mut i32, code);
+                    ptr::write_unaligned(sc.add(8) as *mut *mut Lobby, job.lobby);
+                    if let Some(member) = job.member {
+                        ptr::write_unaligned(sc.add(0x10) as *mut EntityKey, member);
+                    }
+                    ptr::write_unaligned(sc.add(0x20) as *mut *mut c_void, job.async_ctx);
+                    queue(m, sc);
+                }
+                // A failed post is not echoed: the service did not accept the update, and the
+                // next poll corrects the local view instead.
+                if code == 0 && !job.delta.is_empty() {
+                    emit_updated(m, job.lobby, job.delta, false);
+                }
+            }
+        },
+        (),
+    );
+}
+
+fn run_broker_job(job: BrokerJob) {
+    match job {
+        BrokerJob::Create(j) => run_create(j),
+        BrokerJob::Join(j) => run_join(j),
+        BrokerJob::Find(j) => run_find(j),
+        BrokerJob::Leave(j) => run_leave(j),
+        BrokerJob::PostUpdate(j) => run_post(j),
+    }
+}
+
+fn broker_thread_main() {
+    let q = broker_queue();
+    let mut next_poll = Instant::now();
+    loop {
+        // Drain every queued operation first (the queue preserves call order).
+        loop {
+            let job = q
+                .q
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front();
+            match job {
+                Some(j) => run_broker_job(j),
+                None => break,
+            }
+        }
+        if Instant::now() >= next_poll {
+            next_poll = Instant::now() + Duration::from_millis(BROKER_POLL_MS);
+            poll_all_lobbies();
+        } else {
+            let guard = q.q.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = q
+                .cv
+                .wait_timeout(guard, Duration::from_millis(BROKER_WAIT_MS));
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn PFMultiplayerInitialize(
     title_id: *const c_char,
@@ -1905,16 +2513,20 @@ pub unsafe extern "C" fn PFMultiplayerInitialize(
         return E_PF_INSTANCE_ALREADY_EXISTS;
     }
     let title = CString::new(read_cstr(title_id)).unwrap_or_else(|_| CString::new("lan").unwrap());
-    debug_log(&format!("PFMultiplayerInitialize title={}", title.to_string_lossy()));
+    let generation = INSTANCE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    debug_log(&format!(
+        "PFMultiplayerInitialize title={} gen={generation}",
+        title.to_string_lossy()
+    ));
     let mut boxed = Box::new(Mp {
         title,
         token: None,
         entity: None,
+        generation,
         lobbies: Vec::new(),
         pending: VecDeque::new(),
         in_flight: Vec::new(),
         batch_outstanding: false,
-        last_poll: Instant::now() - Duration::from_secs(10),
         pending_joins: Vec::new(),
         start_state: StateLog::new(),
         finish_state: StateLog::new(),
@@ -1923,6 +2535,7 @@ pub unsafe extern "C" fn PFMultiplayerInitialize(
     probe_snapshot(&boxed);
     *g().lock().unwrap() = Some(boxed);
     start_queue_heartbeat();
+    ensure_broker_thread();
     S_OK
 }
 
@@ -2025,35 +2638,30 @@ pub unsafe extern "C" fn PFMultiplayerCreateAndJoinLobby(
         search.len(),
         member_kv.len()
     ));
-    let mut lobby = match post_create(
+    let generation = current_generation();
+    let owner_id = read_cstr(owner.id);
+    // The request body is built here, on the caller's thread: the create/join config pointers
+    // point into the caller's memory and must not be dereferenced by the worker later.
+    let body = build_create_body(
         max,
         owner_migration_policy,
         &lobby_data,
         &search,
-        &read_cstr(owner.id),
+        &owner_id,
         &member_kv,
-    ) {
-        Ok(l) => l,
-        Err(code) => {
-            log_line(&format!("CreateAndJoinLobby failed code=0x{code:08X}"));
-            if !out_lobby.is_null() {
-                *out_lobby = ptr::null_mut();
-            }
-            return code;
-        }
-    };
-    lobby.owner = owner;
-    lobby.has_owner = true;
-    lobby.access_policy = access_policy;
+    );
+    let mut lobby = new_placeholder(owner, max, access_policy);
     lobby.members.push(owner);
-    let mid = read_cstr(owner.id);
+    let mid = owner_id.clone();
     let mut mp = HashMap::new();
-    apply_props(&mut mp, member_kv);
+    apply_props(&mut mp, member_kv.clone());
     ensure_member_props(&mut mp, &mid);
     debug_log(&format!(
         "CreateAndJoinLobby member_props={} id={mid}",
         mp.len()
     ));
+    apply_props(&mut lobby.props, lobby_data.clone());
+    apply_props(&mut lobby.search, search.clone());
     debug_log(&format!(
         "CreateAndJoinLobby data search_keys=[{}] lobby_keys=[{}]",
         map_preview(&lobby.search, 400),
@@ -2083,19 +2691,19 @@ pub unsafe extern "C" fn PFMultiplayerCreateAndJoinLobby(
     with_mp(
         |m| {
             m.lobbies.push(lp);
-            // Documented order (PFMultiplayerCreateAndJoinLobby): MemberAdded, then
-            // CreateAndJoinLobbyCompleted. MemberAdded seeds the exe's cached handle.
-            emit_member_added(m, lp, owner);
-            let sc = alloc_sc(0x20, 0);
-            if !sc.is_null() {
-                ptr::write_unaligned(sc.add(4) as *mut i32, 0);
-                ptr::write_unaligned(sc.add(8) as *mut *mut c_void, async_ctx);
-                ptr::write_unaligned(sc.add(0x10) as *mut *mut Lobby, lp);
-                queue(m, sc);
-            }
         },
         (),
     );
+    enqueue_job(BrokerJob::Create(CreateJob {
+        generation,
+        body,
+        owner,
+        lobby: lp,
+        async_ctx,
+        max_players: max,
+        lobby_data,
+        search,
+    }));
     if !out_lobby.is_null() {
         *out_lobby = lp as *mut c_void;
     }
@@ -2121,51 +2729,28 @@ pub unsafe extern "C" fn PFMultiplayerJoinLobby(
         "JoinLobby conn={conn} member_props={}",
         member_kv.len()
     ));
-    let mut lobby = match post_join(&conn, &read_cstr(joiner_ek.id), &member_kv) {
-        Ok(l) => l,
-        Err(code) => {
-            log_line(&format!("JoinLobby failed conn={conn} code=0x{code:08X}"));
-            if !out_lobby.is_null() {
-                *out_lobby = ptr::null_mut();
-            }
-            return code;
-        }
-    };
-    debug_log(&format!(
-        "JoinLobby lobby id={} search_keys=[{}] lobby_keys=[{}]",
-        lobby.id.to_string_lossy(),
-        map_preview(&lobby.search, 500),
-        map_preview(&lobby.props, 300)
-    ));
+    let generation = current_generation();
     let mid = read_cstr(joiner_ek.id);
-    if !lobby.members.iter().any(|m| read_cstr(m.id) == mid) {
-        lobby.members.push(joiner_ek);
-    }
-    let mut mp = HashMap::new();
-    apply_props(&mut mp, member_kv);
-    ensure_member_props(&mut mp, &mid);
-    lobby.member_props.insert(mid, mp);
+    let body = build_join_body(&conn, &mid, &member_kv);
+    let lobby = new_placeholder(joiner_ek, 0, 0);
     let lp = Box::into_raw(lobby);
-    if !out_lobby.is_null() {
-        *out_lobby = lp as *mut c_void;
-    }
     with_mp(
         |m| {
             m.lobbies.push(lp);
-            if lobby_ready_for_guest(&*lp) {
-                emit_join_completed(m, lp, joiner_ek, async_ctx);
-            } else {
-                debug_log("JoinLobby waiting for network_descriptor");
-                m.pending_joins.push(PendingJoin {
-                    lobby: lp,
-                    joiner: joiner_ek,
-                    async_ctx,
-                    emitted: false,
-                });
-            }
         },
         (),
     );
+    enqueue_job(BrokerJob::Join(JoinJob {
+        generation,
+        body,
+        joiner: joiner_ek,
+        member_kv,
+        lobby: lp,
+        async_ctx,
+    }));
+    if !out_lobby.is_null() {
+        *out_lobby = lp as *mut c_void;
+    }
     S_OK
 }
 
@@ -2292,99 +2877,14 @@ pub unsafe extern "C" fn PFMultiplayerFindLobbies(
         ));
     }
     body.push('}');
-    let (status, text) =
-        http_json_status("POST", "/Lobby/FindLobbies", &body).unwrap_or((0, String::new()));
-    let rows: Vec<String> = if status == 200 {
-        json_arr_objects(&text, "Lobbies")
-            .into_iter()
-            .filter(|row| find_row_live(row))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    // The genuine FindLobbies is asynchronous: it returns S_OK and reports the service
-    // failure in FindLobbiesCompleted.result. Keep that shape instead of faking a
-    // zero-result success when the broker is down or refuses.
-    let result_code = if status == 200 {
-        0
-    } else {
-        broker_error_code(status, &text)
-    };
-    debug_log(&format!("FindLobbies n={}", rows.len()));
-    for row in rows.iter().take(4) {
-        let sd = json_obj(row, "SearchData");
-        let mut keys: Vec<String> = sd
-            .iter()
-            .map(|(k, v)| format!("{k}={}", preview_str(v, 48)))
-            .collect();
-        keys.sort();
-        debug_log(&format!(
-            "FindLobbies row {} search=[{}]",
-            json_str(row, "LobbyId").unwrap_or_default(),
-            preview_str(&keys.join(", "), 500)
-        ));
-    }
-    with_mp(
-        |m| {
-            let n = rows.len().min(16);
-            let results = if n == 0 {
-                ptr::null_mut()
-            } else {
-                let layout = std::alloc::Layout::array::<SearchResult>(n).unwrap();
-                std::alloc::alloc_zeroed(layout) as *mut SearchResult
-            };
-            for (i, row) in rows.iter().take(n).enumerate() {
-                let id = json_str(row, "LobbyId").unwrap_or_default();
-                let conn = json_str(row, "ConnectionString").unwrap_or_default();
-                let max_member = json_max_players(row);
-                let cur: u32 = json_str(row, "CurrentPlayers")
-                    .and_then(|s| s.parse().ok())
-                    .or_else(|| {
-                        row.split("\"CurrentPlayers\":")
-                            .nth(1)
-                            .and_then(|s| {
-                                s.chars()
-                                    .take_while(|c| c.is_ascii_digit())
-                                    .collect::<String>()
-                                    .parse()
-                                    .ok()
-                            })
-                    })
-                    .unwrap_or(1)
-                    .clamp(1, max_member);
-                let search = json_obj(row, "SearchData");
-                let (search_count, search_keys, search_vals) = intern_kv_arrays(&search);
-                let r = SearchResult {
-                    lobby_id: intern(&id),
-                    connection: intern(&conn),
-                    owner: intern_owner_key(row),
-                    max_member,
-                    current_member: cur,
-                    search_count,
-                    _pad0: 0,
-                    search_keys,
-                    search_vals,
-                    friend_count: 0,
-                    _pad1: 0,
-                    friends: ptr::null(),
-                    membership_lock: 0,
-                    _pad2: 0,
-                };
-                ptr::write(results.add(i), r);
-            }
-            let sc = alloc_sc(0x38, 12);
-            if !sc.is_null() {
-                ptr::write_unaligned(sc.add(4) as *mut i32, result_code);
-                let searcher = intern_entity(_entity);
-                ptr::write_unaligned(sc.add(8) as *mut EntityKey, searcher);
-                ptr::write_unaligned(sc.add(0x18) as *mut *mut c_void, async_ctx);
-                ptr::write_unaligned(sc.add(0x20) as *mut u32, n as u32);
-                ptr::write_unaligned(sc.add(0x28) as *mut *mut SearchResult, results);
-                queue(m, sc);
-            }
-        },
-        (),
-    );
+    let generation = current_generation();
+    let entity = intern_entity(_entity);
+    enqueue_job(BrokerJob::Find(FindJob {
+        generation,
+        body,
+        entity,
+        async_ctx,
+    }));
     S_OK
 }
 
@@ -2405,83 +2905,10 @@ pub unsafe extern "C" fn PFMultiplayerStartProcessingLobbyStateChanges(
     with_mp(
         |m| {
             Q_STARTS.fetch_add(1, Ordering::Relaxed);
-            if m.last_poll.elapsed() > Duration::from_millis(250) {
-                m.last_poll = Instant::now();
-                let lps: Vec<*mut Lobby> = m.lobbies.clone();
-                for lp in lps {
-                    // Two users: type-7 LobbyUpdated fires only for a real delta, while
-                    // type-10 (PF-03) fires on the `gone` flag itself, because refresh_lobby returns
-                    // gone=true from an early return that carries no delta (OC-5).
-                    let (departed, gone, delta) = refresh_lobby(&mut *lp);
-                    for eid in departed {
-                        // PFLobbyMemberRemovedStateChange: result@+4, lobby@+8, member@+0x10,
-                        // reason@+0x20. Exe handler 0x143B48360 reads +8 and +0x10 (verified).
-                        let sc = alloc_sc(0x28, 4);
-                        if sc.is_null() {
-                            break;
-                        }
-                        ptr::write_unaligned(sc.add(4) as *mut i32, 0);
-                        ptr::write_unaligned(sc.add(8) as *mut *mut Lobby, lp);
-                        let ek = EntityKey {
-                            id: intern(&eid),
-                            type_: intern("title_player_account"),
-                        };
-                        ptr::write_unaligned(sc.add(0x10) as *mut EntityKey, ek);
-                        ptr::write_unaligned(sc.add(0x20) as *mut u32, 0);
-                        queue(m, sc);
-                        // Allow a later re-join to be announced again.
-                        (*lp).announced.remove(&eid);
-                        debug_log(&format!("MemberRemoved entity={eid}"));
-                    }
-                    // PF-03 re-fix: `refresh_lobby` returns gone=true from its early non-200 return,
-                    // which carries no delta — so gating this on a change made the emission
-                    // unreachable (ORDINAL_CHAIN_AUDIT OC-5). Emit on `gone` itself; the retain
-                    // below guarantees it fires at most once per lobby.
-                    if gone {
-                        // PFLobbyDisconnectedStateChange: lobby@+8 (the exe's handler reads only
-                        // this, then clears its cached PFLobbyHandle at ctx+0x1d0).
-                        (*lp).left = true;
-                        let sc = alloc_sc(0x18, 10);
-                        if !sc.is_null() {
-                            ptr::write_unaligned(sc.add(4) as *mut i32, 0);
-                            ptr::write_unaligned(sc.add(8) as *mut *mut Lobby, lp);
-                            queue(m, sc);
-                        }
-                        m.lobbies.retain(|p| *p != lp);
-                        log_line(&format!(
-                            "LobbyDisconnected id={} (broker returned non-200); queued type 10, stopped polling",
-                            (*lp).id.to_string_lossy()
-                        ));
-                    }
-                    let pending = m
-                        .pending_joins
-                        .iter()
-                        .any(|pj| pj.lobby == lp && !pj.emitted);
-                    // While a join is pending, the join-completion path owns the delivery
-                    // order (MemberAdded -> Updated -> JoinLobbyCompleted); the poll must not
-                    // race a type-7 in front of it. A disconnected lobby gets its type-10
-                    // instead of an Updated.
-                    if !pending {
-                        // The exe's Updated handler gates on the cached lobby handle
-                        // (ctx+0x1d0 == SC+8); MemberAdded seeds it, so members are announced
-                        // first (idempotent via `announced`).
-                        announce_lobby_members(m, lp);
-                        if !gone {
-                            emit_updated(m, lp, delta, false);
-                        }
-                    }
-                }
-                let mut ready = Vec::new();
-                for (i, pj) in m.pending_joins.iter().enumerate() {
-                    if !pj.emitted && lobby_ready_for_guest(&*pj.lobby) {
-                        ready.push(i);
-                    }
-                }
-                for i in ready.into_iter().rev() {
-                    let pj = m.pending_joins.remove(i);
-                    emit_join_completed(m, pj.lobby, pj.joiner, pj.async_ctx);
-                }
-            }
+            // No network I/O here: the broker worker owns every request and the periodic
+            // GetLobby refresh. Start only drains, exactly like the genuine SDK (AUDIT_PLAYFAB
+            // PF-06: real Start RVA 0x3FA90 never touches the network).
+            //
             // Only build a batch when nothing is outstanding: if the title calls Start again
             // before Finish, `in_flight` still belongs to it, so leave it untouched and re-return
             // it below. Queued changes stay in `pending` for the next real batch.
@@ -3063,10 +3490,10 @@ pub unsafe extern "C" fn PFLobbyPostUpdate(
     // The real service applies the update and pushes a PFLobbyUpdatedStateChange back to
     // every member including the author; only then does the title's view reflect it
     // (PFLobbyPostUpdate docs). The shim applies locally for its own getters, so the
-    // synthesised echo is emitted here from the difference the local apply produced.
-    // A failed post is not echoed: the service did not accept the update, and the next
-    // poll will correct the local view instead.
-    let posted = post_update(
+    // synthesised echo is emitted from the difference the local apply produced — by the worker
+    // once the service accepted the post. A failed post is not echoed: the next poll corrects
+    // the local view instead.
+    let body = build_update_body(
         l,
         &search_deletes,
         &lobby_deletes,
@@ -3074,35 +3501,20 @@ pub unsafe extern "C" fn PFLobbyPostUpdate(
         &member_deletes,
         &scalars,
     );
-    let delta = if posted {
-        Some(unsafe { diff_lobby(&before, l) })
-    } else {
+    let delta = unsafe { diff_lobby(&before, l) };
+    let member_ek = if member.is_null() {
         None
+    } else {
+        Some(ptr::read(member))
     };
-    with_mp(
-        |m| {
-            // PFLobbyPostUpdateCompletedStateChange is 0x28: result@+4, lobby@+8,
-            // localUser@+0x10, asyncContext@+0x20. (Previously 0x18 with the lobby written at
-            // +0x10, which is the localUser slot.) The exe currently reads only result@+4, so
-            // this was masked rather than harmful.
-            let sc = alloc_sc(0x28, 8);
-            if !sc.is_null() {
-                ptr::write_unaligned(sc.add(4) as *mut i32, 0);
-                ptr::write_unaligned(sc.add(8) as *mut *mut Lobby, lobby as *mut Lobby);
-                if !member.is_null() {
-                    ptr::write_unaligned(sc.add(0x10) as *mut EntityKey, ptr::read(member));
-                }
-                ptr::write_unaligned(sc.add(0x20) as *mut *mut c_void, async_ctx);
-                queue(m, sc);
-            }
-            // The Updated follows the completion ("sometime afterwards" in the PostUpdate
-            // contract) and carries only what the apply actually changed.
-            if let Some(delta) = delta {
-                emit_updated(m, l, delta, false);
-            }
-        },
-        (),
-    );
+    enqueue_job(BrokerJob::PostUpdate(PostJob {
+        generation: current_generation(),
+        body,
+        lobby: lobby as *mut Lobby,
+        member: member_ek,
+        async_ctx,
+        delta,
+    }));
     S_OK
 }
 
@@ -3126,23 +3538,24 @@ pub unsafe extern "C" fn PFLobbyLeave(
                 json_escape(&eid)
             )
         };
-        let _ = http_json("POST", "/Lobby/LeaveLobby", &body);
+        let generation = current_generation();
+        // The handle is dead for the title as soon as Leave returns (the genuine docs say not to
+        // use it afterwards), so the local teardown stays synchronous; only the broker POST and
+        // the type-6 completion move to the worker.
+        (*(lobby as *mut Lobby)).left = true;
+        with_mp(
+            |m| {
+                m.lobbies.retain(|p| *p as *mut c_void != lobby);
+            },
+            (),
+        );
         debug_log(&format!("Leave {id} entity={eid}"));
+        enqueue_job(BrokerJob::Leave(LeaveJob {
+            generation,
+            body,
+            lobby: lobby as *mut Lobby,
+        }));
     }
-    with_mp(
-        |m| {
-            if !lobby.is_null() {
-                (*(lobby as *mut Lobby)).left = true;
-            }
-            m.lobbies.retain(|p| *p as *mut c_void != lobby);
-            let sc = alloc_sc(0x18, 6);
-            if !sc.is_null() {
-                ptr::write_unaligned(sc.add(4) as *mut i32, 0);
-                queue(m, sc);
-            }
-        },
-        (),
-    );
     S_OK
 }
 
@@ -3156,8 +3569,20 @@ pub unsafe extern "C" fn PFLobbyForceRemoveMember(
     if _target.is_null() || read_cstr((*_target).id).is_empty() {
         return E_PF_ENTITY_KEY_MALFORMED;
     }
-    // LAN sessions have no kick/ban path (the exe only calls this for host kicks), and a
-    // fabricated removal would desync the broker roster; keep the documented no-op.
+    // The exe reaches this from its roster/kick path and from the Party EndpointDestroyed
+    // handler (a remote endpoint dies -> the owner removes that member). Log it (debug only)
+    // so a run shows whether the host game tries a kick; keep the no-op otherwise: a
+    // fabricated removal would desync the broker roster.
+    let target = read_cstr((*_target).id);
+    let lobby_id = if _lobby.is_null() {
+        String::new()
+    } else {
+        (*(_lobby as *mut Lobby)).id.to_string_lossy().into_owned()
+    };
+    debug_log(&format!(
+        "ForceRemoveMember lobby={lobby_id} target={target} prevent_rejoin={} (LAN no-op: no kick path)",
+        _prevent != 0
+    ));
     S_OK
 }
 

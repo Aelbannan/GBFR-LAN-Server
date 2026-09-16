@@ -122,9 +122,12 @@ budget (`work+0xb8 = 30000 ms`) — see `game-integration.md`.
 `LeaveLobby` all hit `POST /Lobby/*` on the broker. The lobby list lives only in the broker
 process memory; connection strings are `lan.<title_id>.lan-<12-hex-id>`.
 
-While the lobby is live, `PFMultiplayerStartProcessingLobbyStateChanges` polls
-`GetLobby` every 250 ms and queues the state changes the exe consumes as the roster changes
-(`MemberAdded`, `Updated`, `MemberRemoved`, `Disconnected`, …).
+The PlayFab shim performs every broker request on a background `pfbroker` worker thread:
+the exports build the request on the calling thread and return immediately, and the worker
+does the I/O, applies the result and queues the state changes the exe consumes via
+`PFMultiplayerStartProcessingLobbyStateChanges` (which only drains and never blocks). The
+worker also polls `GetLobby` every 250 ms and queues the roster changes (`MemberAdded`,
+`Updated`, `MemberRemoved`, `Disconnected`, …).
 
 ### 4. Party mesh
 

@@ -60,6 +60,8 @@ error code, or a field value.
 - Asynchronous API shape: create/join/find/post/leave return `S_OK` and report the outcome
   in a completion state change; `FindLobbies` reports service failure in
   `FindLobbiesCompleted.result`.
+- All broker I/O runs on a worker thread; `PFMultiplayerStartProcessingLobbyStateChanges`
+  carries no network work and never blocks (the real `Start` only drains its queue).
 - Ordering rules that matter: `MemberAdded` before `CreateAndJoinCompleted`; `MemberAdded(s)`
   → Updated (with `membershipLockUpdated`) → `JoinLobbyCompleted`; a local post echoes
   `PostUpdateCompleted` then an Updated diff.
@@ -86,7 +88,7 @@ error code, or a field value.
 | Property key arrays | `kv_list` / `intern_kv_arrays` truncate to 32 keys with a log (the real SDK has no such cap) |
 | Allocation lifetime | state-change buffers are not freed in `Finish` (accepted leak, bounded by session length) |
 | Handle validation | most exports do not validate that the `PFMultiplayerHandle` belongs to the shim (the real DLL returns `0x89236400`); getters validate their own pointers |
-| `PFLobbyLeave` | always emits type 6 with `result = 0` even if the broker call failed (the exe ignores the body) |
+| `PFLobbyLeave` | the local lobby is torn down before the broker replies; type 6 is emitted asynchronously with the broker's result in `result` (+4) |
 | `PFLobbyMemberDataUpdate` | a dead parse branch (the exe always passes NULL for member data updates) |
 
 ## Party shim fidelity

@@ -161,17 +161,32 @@ fn main() {
         );
         check!(rc == 0 && !lobby.is_null(), "PFMultiplayerCreateAndJoinLobby rc=0x{rc:08X}");
 
-        let drain = |n: &str| {
-            for _ in 0..4 {
+        // The broker work is async now, so completions must be pumped out of the state-change
+        // queue instead of being assumed to be ready immediately after the call.
+        let pump = |want: &[u32], timeout_ms: u64, what: &str| -> bool {
+            let t0 = std::time::Instant::now();
+            let mut seen = false;
+            while t0.elapsed() < std::time::Duration::from_millis(timeout_ms) {
                 let mut count: u32 = 0;
                 let mut changes: *mut *mut u8 = ptr::null_mut();
-                if start(handle, &mut count, &mut changes) == 0 && count > 0 {
+                if start(handle, &mut count, &mut changes) == 0 {
+                    for i in 0..count as usize {
+                        let p = *changes.add(i);
+                        if want.contains(&*(p as *const u32)) {
+                            seen = true;
+                        }
+                    }
                     finish(handle, count, changes);
                 }
+                if seen {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            println!("   (drained state changes after {n})");
+            println!("   (pumped {what}: seen={seen})");
+            seen
         };
-        drain("create");
+        check!(pump(&[0], 3000, "create completion"), "create completed (type 0)");
 
         let k_comment = cs("comment1");
         let k_extra = cs("extra");
@@ -209,7 +224,10 @@ fn main() {
             ptr::null_mut(),
         );
         check!(rc == 0, "PFLobbyPostUpdate(delete lists) rc=0x{rc:08X}");
-        drain("post-update deletes");
+        check!(
+            pump(&[8], 3000, "post-update completion"),
+            "post-update completed (type 8)"
+        );
 
         check!(
             get_lobby_prop(lobby, k_comment.as_ptr(), &mut out) == 0 && out.is_null(),
@@ -248,7 +266,10 @@ fn main() {
             ptr::null_mut(),
         );
         check!(rc == 0, "PFLobbyPostUpdate(membershipLock=Locked) rc=0x{rc:08X}");
-        drain("post-update scalar");
+        check!(
+            pump(&[8], 3000, "post-update scalar completion"),
+            "post-update scalar completed (type 8)"
+        );
         let mut lock_val: i32 = -1;
         check!(get_lock(lobby, &mut lock_val) == 0, "PFLobbyGetMembershipLock");
         check!(lock_val == 1, "membershipLock scalar applied locally (got {lock_val})");
