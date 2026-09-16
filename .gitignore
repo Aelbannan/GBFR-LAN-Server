@@ -1,0 +1,21 @@
+# Rust build output
+target/
+
+# Built shims / server (build.ps1 outputs)
+*.dll
+*.exe
+*.exp
+*.lib
+*.pdb
+
+# Runtime logs and local state
+*.log
+*.log.*
+*.bak
+
+# Original shipping DLL backups made by install.ps1
+*.ms
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db

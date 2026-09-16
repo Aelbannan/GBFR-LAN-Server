@@ -1,0 +1,12 @@
+[package]
+name = "playfab-mp-shim"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "PlayFabMultiplayerWin"
+crate-type = ["cdylib"]
+
+# Match the opt level the shim's build.ps1 uses (rustc -C opt-level=2).
+[profile.release]
+opt-level = 2
