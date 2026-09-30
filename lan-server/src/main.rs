@@ -1883,17 +1883,21 @@ enum ReadResult {
     Dropped,
 }
 
-/// Hard ceiling on concurrently served sockets. The game keeps a handful open per client and
-/// Nucleus runs up to 8 clients, so this is far above any real session; it exists so a peer that
-/// opens sockets without sending a request cannot spawn threads without bound.
+/// Hard ceiling on concurrently served sockets per listener. The game keeps a handful open per
+/// client and Nucleus runs up to 8 clients, so this is far above any real session; it exists so a
+/// peer that opens sockets without sending a request cannot spawn threads without bound. The
+/// budget is per listener (HTTP and WS each get one), so a flood on the plaintext port cannot
+/// starve the WebSocket port, and several server instances in one process (the tests) do not
+/// share a counter.
 const MAX_CONNECTIONS: usize = 256;
-static LIVE_CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Listener options. `ws_idle` is an option (rather than a constant) so tests can use a few
-/// milliseconds where a real session uses minutes.
+/// milliseconds where a real session uses minutes; `max_connections` likewise lets a test drive
+/// the refusal path with a handful of sockets instead of 256.
 #[derive(Clone, Copy)]
 struct ServerOpts {
     ws_idle: Duration,
+    max_connections: usize,
 }
 
 impl Default for ServerOpts {
@@ -1903,28 +1907,31 @@ impl Default for ServerOpts {
         // a thread for the process lifetime.
         Self {
             ws_idle: Duration::from_secs(900),
+            max_connections: MAX_CONNECTIONS,
         }
     }
 }
 
-/// RAII slot in the connection budget, dropped on every exit path of a connection.
-struct ConnGuard;
+/// RAII slot in one listener's connection budget, dropped on every exit path of a connection.
+struct ConnGuard {
+    live: Arc<std::sync::atomic::AtomicUsize>,
+}
 
 impl ConnGuard {
-    fn acquire() -> Option<Self> {
-        let n = LIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst) + 1;
-        if n > MAX_CONNECTIONS {
-            LIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+    fn acquire(live: &Arc<std::sync::atomic::AtomicUsize>, cap: usize) -> Option<Self> {
+        let n = live.fetch_add(1, Ordering::SeqCst) + 1;
+        if n > cap {
+            live.fetch_sub(1, Ordering::SeqCst);
             None
         } else {
-            Some(Self)
+            Some(Self { live: live.clone() })
         }
     }
 }
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
-        LIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+        self.live.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -2112,12 +2119,14 @@ fn serve(listener: TcpListener, app: Arc<Mutex<App>>, name: &str, opts: ServerOp
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "?".into());
     request_log(&format!("{name} {addr}"));
+    let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for s in listener.incoming() {
         match s {
             Ok(mut stream) => {
-                let Some(guard) = ConnGuard::acquire() else {
+                let Some(guard) = ConnGuard::acquire(&live, opts.max_connections) else {
                     log_line(&format!(
-                        "connection refused at cap={MAX_CONNECTIONS} local={addr}"
+                        "connection refused at cap={} local={addr}",
+                        opts.max_connections
                     ));
                     send_http(&mut stream, 503, "text/plain", b"too many connections");
                     continue;

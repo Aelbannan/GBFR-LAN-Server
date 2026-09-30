@@ -23,6 +23,14 @@ struct TestServer {
 }
 
 fn start_server() -> TestServer {
+    // A short WebSocket idle so the idle-timeout test is fast; production uses the default.
+    start_server_with(ServerOpts {
+        ws_idle: Duration::from_millis(300),
+        max_connections: MAX_CONNECTIONS,
+    })
+}
+
+fn start_server_with(opts: ServerOpts) -> TestServer {
     let http = bind_listener("127.0.0.1:0").expect("bind http");
     let ws = bind_listener("127.0.0.1:0").expect("bind ws");
     let http_port = http.local_addr().unwrap().port();
@@ -39,10 +47,6 @@ fn start_server() -> TestServer {
     }));
     let http_app = app.clone();
     let ws_app = app.clone();
-    // A short WebSocket idle so the idle-timeout test is fast; production uses the default.
-    let opts = ServerOpts {
-        ws_idle: Duration::from_millis(300),
-    };
     thread::spawn(move || serve(http, http_app, "HTTP-test", opts));
     thread::spawn(move || serve(ws, ws_app, "WS-test", opts));
     TestServer {
@@ -670,8 +674,14 @@ fn ws_upgrade(port: u16) -> TcpStream {
     let mut head = Vec::new();
     let mut b = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
-        let n = s.read(&mut b).expect("upgrade response");
-        assert!(n == 1, "server closed during upgrade");
+        let n = match s.read(&mut b) {
+            Ok(n) => n,
+            Err(e) => panic!("upgrade read on port {port} failed: {e}"),
+        };
+        assert!(
+            n == 1,
+            "server closed during upgrade on port {port} (refused by the connection cap?)"
+        );
         head.push(b[0]);
     }
     let text = String::from_utf8_lossy(&head).to_string();
@@ -806,21 +816,29 @@ fn ws_idle_connection_is_closed_by_the_server() {
 
 #[test]
 fn excessive_idle_connections_are_refused_without_hanging() {
-    let s = start_server();
+    // A small budget so the refusal path is exercised with a handful of sockets instead of 256.
+    let cap = 16usize;
+    let s = start_server_with(ServerOpts {
+        ws_idle: Duration::from_millis(300),
+        max_connections: cap,
+    });
+
+    // The OS completes the TCP handshake even for connections the server will refuse, so these
+    // connects succeed and the refusal shows up on the request instead.
     let mut held = Vec::new();
-    let mut refused = 0usize;
-    for _ in 0..MAX_CONNECTIONS + 40 {
+    for _ in 0..cap + 8 {
         match TcpStream::connect(("127.0.0.1", s.http_port)) {
             Ok(c) => held.push(c),
-            Err(_) => {
-                refused += 1;
-                break;
-            }
+            Err(_) => break,
         }
     }
-    // Whatever the OS backlog did with the connects, the server must stay responsive: a request
-    // either gets a real answer or is refused outright, and never hangs. A reset is a valid
-    // refusal (the server answered 503 and closed before reading the request it never wanted).
+    assert!(
+        held.len() >= cap,
+        "could not hold enough connections to fill the cap: {} < {cap}",
+        held.len()
+    );
+
+    // Past the cap: a 503 or a reset, never a hang.
     let started = SystemTime::now();
     let outcome = try_get(s.http_port, "/health");
     let took = started.elapsed().unwrap_or_default();
@@ -841,16 +859,33 @@ fn excessive_idle_connections_are_refused_without_hanging() {
         took < Duration::from_secs(5),
         "server took {took:?} to answer under idle load"
     );
-    println!(
-        "   held={} refused={} outcome={:?} took={took:?}",
-        held.len(),
-        refused,
-        outcome.map(|(s, _)| s)
+
+    // The budget is per listener: a saturated HTTP port must not lock out the WebSocket port.
+    let mut ws = ws_upgrade(s.ws_port);
+    ws_send(&mut ws, 0x9, b"p");
+    let (opcode, payload) = ws_recv(&mut ws);
+    assert_eq!((opcode, payload.as_slice()), (0xa, b"p".as_slice()));
+
+    // Dropping the held sockets frees the guards; the server must serve normally again.
+    let held_len = held.len();
+    drop(held);
+    let mut status = 0;
+    for _ in 0..100 {
+        if let Ok((s200, _)) = try_get(s.http_port, "/health") {
+            status = s200;
+            if status == 200 {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        status, 200,
+        "server did not recover after the sockets were released"
     );
-    assert!(
-        held.len() > MAX_CONNECTIONS / 2,
-        "test did not hold enough connections to exercise the cap: {}",
-        held.len()
+    println!(
+        "   cap={cap} held={held_len} outcome={:?} took={took:?}",
+        outcome.map(|(s, _)| s)
     );
 }
 /// Local assertion helper so this file keeps the "one line per property" style of the other
