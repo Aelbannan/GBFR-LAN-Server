@@ -5,16 +5,22 @@
 #![allow(non_snake_case)]
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+/// ABI layout / string bridges (pure, unit-tested by `tests/pe_test.rs`).
+mod abi;
+/// Bounds-checked PE import patching (pure, unit-tested by `tests/pe_test.rs`).
+mod pe;
+use abi::{from_c, from_wide, pack_http_completed, pack_webapi_ticket, to_wide};
+use pe::{mov_eax_imm, PAGE_EXECUTE_READWRITE};
+
 include!("../../common/lan_cfg.rs");
 
-const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
 const DLL_PROCESS_ATTACH: u32 = 1;
@@ -40,8 +46,8 @@ const WEBAPI_TICKET_MAX: usize = 2560;
 
 #[link(name = "kernel32")]
 extern "system" {
-    fn GetModuleHandleA(name: *const u8) -> *mut c_void;
-    fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    fn GetModuleHandleA(name: *const c_char) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
     fn VirtualProtect(addr: *mut c_void, size: usize, new: u32, old: *mut u32) -> i32;
     fn VirtualAlloc(addr: *mut c_void, size: usize, ty: u32, prot: u32) -> *mut c_void;
     fn GetModuleFileNameW(module: *mut c_void, buf: *mut u16, size: u32) -> u32;
@@ -59,7 +65,12 @@ extern "system" {
         bypass: *const u16,
         flags: u32,
     ) -> *mut c_void;
-    fn WinHttpConnect(session: *mut c_void, host: *const u16, port: u16, reserved: u32) -> *mut c_void;
+    fn WinHttpConnect(
+        session: *mut c_void,
+        host: *const u16,
+        port: u16,
+        reserved: u32,
+    ) -> *mut c_void;
     fn WinHttpOpenRequest(
         connect: *mut c_void,
         verb: *const u16,
@@ -96,7 +107,12 @@ extern "system" {
     fn WinHttpReadData(request: *mut c_void, buf: *mut u8, size: u32, read: *mut u32) -> i32;
     fn WinHttpSetOption(h: *mut c_void, option: u32, buf: *mut c_void, len: u32) -> i32;
     fn WinHttpCloseHandle(h: *mut c_void) -> i32;
-    fn WinHttpCrackUrl(url: *const u16, len: u32, flags: u32, comp: *mut WinHttpUrlComponents) -> i32;
+    fn WinHttpCrackUrl(
+        url: *const u16,
+        len: u32,
+        flags: u32,
+        comp: *mut WinHttpUrlComponents,
+    ) -> i32;
 }
 
 #[repr(C)]
@@ -155,21 +171,14 @@ static ORIG_REG_CALL: OnceLock<unsafe extern "system" fn(*mut c_void, u64)> = On
 static ORIG_UNREG_CALL: OnceLock<unsafe extern "system" fn(*mut c_void, u64)> = OnceLock::new();
 static ORIG_REG_CB: OnceLock<unsafe extern "system" fn(*mut c_void, i32)> = OnceLock::new();
 static ORIG_UNREG_CB: OnceLock<unsafe extern "system" fn(*mut c_void)> = OnceLock::new();
-static ORIG_WEBAPI: OnceLock<unsafe extern "system" fn(*mut c_void, *const c_char) -> u32> = OnceLock::new();
+static ORIG_WEBAPI: OnceLock<unsafe extern "system" fn(*mut c_void, *const c_char) -> u32> =
+    OnceLock::new();
 static ORIG_SVC_CFG: OnceLock<
     unsafe extern "C" fn(*const c_char, *const c_char, *mut *mut c_void) -> i32,
 > = OnceLock::new();
-type WinHttpConnectFn =
-    unsafe extern "system" fn(*mut c_void, *const u16, u16, u32) -> *mut c_void;
-type WinHttpSendFn = unsafe extern "system" fn(
-    *mut c_void,
-    *const u16,
-    u32,
-    *const u8,
-    u32,
-    u32,
-    usize,
-) -> i32;
+type WinHttpConnectFn = unsafe extern "system" fn(*mut c_void, *const u16, u16, u32) -> *mut c_void;
+type WinHttpSendFn =
+    unsafe extern "system" fn(*mut c_void, *const u16, u32, *const u8, u32, u32, usize) -> i32;
 static ORIG_WH_CONNECT: OnceLock<WinHttpConnectFn> = OnceLock::new();
 static ORIG_WH_SEND: OnceLock<WinHttpSendFn> = OnceLock::new();
 type WinHttpOpenRequestFn = unsafe extern "system" fn(
@@ -190,6 +199,15 @@ struct UtilsOrig {
     get_result: unsafe extern "system" fn(*mut c_void, u64, *mut u8, i32, i32, *mut u8) -> u8,
 }
 
+/// The shim state lock, recovering from a poisoned mutex: a panic while the state was held (in a
+/// hook or a worker) must not turn every later Steam/WinHTTP call into a panic across the FFI
+/// boundary, which the game would see as a crash.
+fn state_lock() -> std::sync::MutexGuard<'static, State> {
+    state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn state() -> &'static Mutex<State> {
     STATE.get_or_init(|| {
         Mutex::new(State {
@@ -207,7 +225,7 @@ fn state() -> &'static Mutex<State> {
 fn log_file() -> std::path::PathBuf {
     unsafe {
         let mut buf = [0u16; 260];
-        let steam = GetModuleHandleA(b"steam_api64.dll\0".as_ptr());
+        let steam = GetModuleHandleA(c"steam_api64.dll".as_ptr());
         let n = if steam.is_null() {
             GetModuleFileNameW(ptr::null_mut(), buf.as_mut_ptr(), 260)
         } else {
@@ -268,34 +286,6 @@ fn debug_log(msg: &str) {
     }
 }
 
-fn to_wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn from_c(p: *const c_char) -> String {
-    if p.is_null() {
-        return String::new();
-    }
-    unsafe {
-        let mut n = 0usize;
-        while n < 4096 && *p.add(n) != 0 {
-            n += 1;
-        }
-        String::from_utf8_lossy(std::slice::from_raw_parts(p as *const u8, n)).into_owned()
-    }
-}
-
-fn pack_http_completed(handle: u32, context: u64, ok: bool, status: u32, body_len: u32) -> [u8; 32] {
-    // MSVC x64 HTTPRequestCompleted_t (uint32 + pad + uint64 + bool + pad + enum + uint32)
-    let mut p = [0u8; 32];
-    p[0..4].copy_from_slice(&handle.to_le_bytes());
-    p[8..16].copy_from_slice(&context.to_le_bytes());
-    p[16] = if ok { 1 } else { 0 };
-    p[20..24].copy_from_slice(&status.to_le_bytes());
-    p[24..28].copy_from_slice(&body_len.to_le_bytes());
-    p
-}
-
 fn exe_dir() -> std::path::PathBuf {
     let mut buf = [0u16; 260];
     let n = unsafe { GetModuleFileNameW(ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32) };
@@ -332,31 +322,6 @@ fn lan_steam_ticket() -> Vec<u8> {
     let steam = read_account_steamid();
     let pc = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "pc".into());
     format!("LANSTUB|{steam}|{pc}").into_bytes()
-}
-
-fn pack_webapi_ticket(handle: u32) -> Vec<u8> {
-    // GetTicketForWebApiResponse_t: HAuthTicket, EResult, cubTicket, rgubTicket[2560]
-    let ticket = lan_steam_ticket();
-    let n = ticket.len().min(WEBAPI_TICKET_MAX);
-    let mut p = vec![0u8; 12 + WEBAPI_TICKET_MAX];
-    p[0..4].copy_from_slice(&handle.to_le_bytes());
-    p[4..8].copy_from_slice(&1u32.to_le_bytes()); // k_EResultOK
-    p[8..12].copy_from_slice(&(n as u32).to_le_bytes());
-    p[12..12 + n].copy_from_slice(&ticket[..n]);
-    p
-}
-
-fn mov_eax_imm(code: &[u8]) -> Option<u32> {
-    // mov eax, imm32  (B8 xx xx xx xx) optionally followed by ret (C3)
-    if code.len() >= 5 && code[0] == 0xB8 {
-        return Some(u32::from_le_bytes(code[1..5].try_into().ok()?));
-    }
-    for i in 0..code.len().saturating_sub(5) {
-        if code[i] == 0xB8 {
-            return Some(u32::from_le_bytes(code[i + 1..i + 5].try_into().ok()?));
-        }
-    }
-    None
 }
 
 /// # Safety
@@ -405,8 +370,7 @@ unsafe fn invoke_callback(obj: usize, data: *mut u8, default_run: usize) {
     }
     let slots = vptr as *mut *mut c_void;
     let idx = callback_run_index(obj, default_run);
-    let run: unsafe extern "system" fn(*mut c_void, *mut u8) =
-        std::mem::transmute(*slots.add(idx));
+    let run: unsafe extern "system" fn(*mut c_void, *mut u8) = std::mem::transmute(*slots.add(idx));
     run(obj as *mut c_void, data);
 }
 
@@ -414,7 +378,10 @@ unsafe extern "system" fn blogged_on(_this: *mut c_void) -> u8 {
     1
 }
 
-unsafe extern "system" fn get_auth_ticket_webapi(this: *mut c_void, identity: *const c_char) -> u32 {
+unsafe extern "system" fn get_auth_ticket_webapi(
+    this: *mut c_void,
+    identity: *const c_char,
+) -> u32 {
     let id = from_c(identity);
     // Cygames sys/user_auth uses identity server_auth_key_001 (pointer table
     // 0x145F3AC10). PlayFab login uses playfab_services. Goldberg may return a
@@ -435,7 +402,7 @@ unsafe extern "system" fn get_auth_ticket_webapi(this: *mut c_void, identity: *c
         "GetAuthTicketForWebApi '{}' stub={} ticket={}",
         id, handle, ticket
     ));
-    state().lock().unwrap().pending_webapi.push(handle);
+    state_lock().pending_webapi.push(handle);
     handle
 }
 
@@ -455,7 +422,7 @@ unsafe extern "system" fn hook_reg_cb(cb: *mut c_void, i_callback: i32) {
 
 unsafe extern "system" fn hook_unreg_cb(cb: *mut c_void) {
     if !cb.is_null() {
-        let mut st = state().lock().unwrap();
+        let mut st = state_lock();
         st.callbacks.retain(|(_, p)| *p != cb as usize);
         st.fired_connected.remove(&(cb as usize));
     }
@@ -466,7 +433,7 @@ unsafe extern "system" fn hook_unreg_cb(cb: *mut c_void) {
 
 fn dispatch_steam_user_callbacks() {
     let (connected, tickets, cbs) = {
-        let mut st = state().lock().unwrap();
+        let mut st = state_lock();
         let tickets = std::mem::take(&mut st.pending_webapi);
         let cbs = st.callbacks.clone();
         let mut connected = Vec::new();
@@ -483,7 +450,7 @@ fn dispatch_steam_user_callbacks() {
         debug_log(&format!("dispatched SteamServersConnected_t cb={:#x}", ptr));
     }
     for handle in tickets {
-        let mut packed = pack_webapi_ticket(handle);
+        let mut packed = pack_webapi_ticket(handle, &lan_steam_ticket(), WEBAPI_TICKET_MAX);
         let mut n = 0;
         for (id, ptr) in &cbs {
             if *id == CB_TICKET_FOR_WEBAPI {
@@ -503,12 +470,28 @@ fn dispatch_steam_user_callbacks() {
 /// `vtable` points at a live vtable whose `index`-th slot exists, and `new_fn` has the same ABI
 /// as the function stored there. VirtualProtect is required because vtables sit in read-only
 /// pages after the loader maps them; the original protection is restored before returning.
-unsafe fn patch_slot(vtable: *mut *mut c_void, index: usize, new_fn: *mut c_void) {
+unsafe fn patch_slot(vtable: *mut *mut c_void, index: usize, new_fn: *mut c_void) -> bool {
+    if vtable.is_null() {
+        debug_log("patch_slot: null vtable, skipped");
+        return false;
+    }
     let slot = vtable.add(index);
+    let size = std::mem::size_of::<*mut c_void>();
     let mut old = 0u32;
-    VirtualProtect(slot as *mut c_void, std::mem::size_of::<*mut c_void>(), PAGE_EXECUTE_READWRITE, &mut old);
+    if VirtualProtect(slot as *mut c_void, size, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+        debug_log(&format!(
+            "patch_slot: VirtualProtect failed at {slot:p}, skipped"
+        ));
+        return false;
+    }
     *slot = new_fn;
-    VirtualProtect(slot as *mut c_void, std::mem::size_of::<*mut c_void>(), old, &mut old);
+    let mut tmp = 0u32;
+    VirtualProtect(slot as *mut c_void, size, old, &mut tmp);
+    let ok = *slot == new_fn;
+    if !ok {
+        debug_log(&format!("patch_slot: write did not stick at {slot:p}"));
+    }
+    ok
 }
 
 fn winhttp_execute(req: &mut Request) {
@@ -517,7 +500,13 @@ fn winhttp_execute(req: &mut Request) {
     // outlive each call. No game memory is touched in this function.
     unsafe {
         let agent = to_wide("GBFR-lan-stub");
-        let session = WinHttpOpen(agent.as_ptr(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, ptr::null(), ptr::null(), 0);
+        let session = WinHttpOpen(
+            agent.as_ptr(),
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            ptr::null(),
+            ptr::null(),
+            0,
+        );
         if session.is_null() {
             log_msg("WinHttpOpen failed");
             req.ok = false;
@@ -671,7 +660,7 @@ unsafe extern "system" fn create_http(_this: *mut c_void, method: i32, url: *con
         return 0;
     }
     let id = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    let mut st = state().lock().unwrap();
+    let mut st = state_lock();
     st.requests.insert(
         id,
         Request {
@@ -690,7 +679,7 @@ unsafe extern "system" fn create_http(_this: *mut c_void, method: i32, url: *con
 }
 
 unsafe extern "system" fn set_context(_this: *mut c_void, handle: u32, value: u64) -> u8 {
-    if let Some(r) = state().lock().unwrap().requests.get_mut(&handle) {
+    if let Some(r) = state_lock().requests.get_mut(&handle) {
         r.context = value;
         1
     } else {
@@ -702,8 +691,13 @@ unsafe extern "system" fn set_timeout(_this: *mut c_void, _handle: u32, _seconds
     1
 }
 
-unsafe extern "system" fn set_header(_this: *mut c_void, handle: u32, name: *const c_char, value: *const c_char) -> u8 {
-    let mut st = state().lock().unwrap();
+unsafe extern "system" fn set_header(
+    _this: *mut c_void,
+    handle: u32,
+    name: *const c_char,
+    value: *const c_char,
+) -> u8 {
+    let mut st = state_lock();
     if let Some(r) = st.requests.get_mut(&handle) {
         r.headers.push((from_c(name), from_c(value)));
         1
@@ -712,13 +706,18 @@ unsafe extern "system" fn set_header(_this: *mut c_void, handle: u32, name: *con
     }
 }
 
-unsafe extern "system" fn set_param(_this: *mut c_void, _h: u32, _n: *const c_char, _v: *const c_char) -> u8 {
+unsafe extern "system" fn set_param(
+    _this: *mut c_void,
+    _h: u32,
+    _n: *const c_char,
+    _v: *const c_char,
+) -> u8 {
     1
 }
 
 unsafe extern "system" fn send_http(_this: *mut c_void, handle: u32, call_out: *mut u64) -> u8 {
     let mut req = {
-        let st = state().lock().unwrap();
+        let st = state_lock();
         match st.requests.get(&handle) {
             Some(r) => Request {
                 method: r.method,
@@ -736,7 +735,7 @@ unsafe extern "system" fn send_http(_this: *mut c_void, handle: u32, call_out: *
     winhttp_execute(&mut req);
     let call = NEXT_CALL.fetch_add(1, Ordering::Relaxed);
     {
-        let mut st = state().lock().unwrap();
+        let mut st = state_lock();
         if let Some(stored) = st.requests.get_mut(&handle) {
             stored.status = req.status;
             stored.response = req.response;
@@ -772,7 +771,12 @@ unsafe extern "system" fn release_cookie_container(_this: *mut c_void, _h: u32) 
     1
 }
 
-unsafe extern "system" fn header_size(_this: *mut c_void, _h: u32, name: *const c_char, size: *mut u32) -> u8 {
+unsafe extern "system" fn header_size(
+    _this: *mut c_void,
+    _h: u32,
+    name: *const c_char,
+    size: *mut u32,
+) -> u8 {
     let n = from_c(name).to_ascii_lowercase();
     if n == "content-type" {
         if !size.is_null() {
@@ -804,26 +808,39 @@ unsafe extern "system" fn header_value(
 }
 
 unsafe extern "system" fn body_size(_this: *mut c_void, handle: u32, size: *mut u32) -> u8 {
-    let st = state().lock().unwrap();
+    let st = state_lock();
     if let Some(r) = st.requests.get(&handle) {
         if !size.is_null() {
             *size = r.response.len() as u32;
         }
-        debug_log(&format!("GetHTTPResponseBodySize {} {}", handle, r.response.len()));
+        debug_log(&format!(
+            "GetHTTPResponseBodySize {} {}",
+            handle,
+            r.response.len()
+        ));
         1
     } else {
         0
     }
 }
 
-unsafe extern "system" fn body_data(_this: *mut c_void, handle: u32, buf: *mut u8, size: u32) -> u8 {
-    let st = state().lock().unwrap();
+unsafe extern "system" fn body_data(
+    _this: *mut c_void,
+    handle: u32,
+    buf: *mut u8,
+    size: u32,
+) -> u8 {
+    let st = state_lock();
     if let Some(r) = st.requests.get(&handle) {
         if size as usize != r.response.len() || buf.is_null() {
             return 0;
         }
         ptr::copy_nonoverlapping(r.response.as_ptr(), buf, r.response.len());
-        debug_log(&format!("GetHTTPResponseBodyData {} {} bytes", handle, r.response.len()));
+        debug_log(&format!(
+            "GetHTTPResponseBodyData {} {} bytes",
+            handle,
+            r.response.len()
+        ));
         1
     } else {
         0
@@ -841,7 +858,7 @@ unsafe extern "system" fn stream_body(
 }
 
 unsafe extern "system" fn release(_this: *mut c_void, handle: u32) -> u8 {
-    state().lock().unwrap().requests.remove(&handle);
+    state_lock().requests.remove(&handle);
     1
 }
 
@@ -859,7 +876,7 @@ unsafe extern "system" fn set_raw_body(
     _content_type: *const c_char,
     len: u32,
 ) -> u8 {
-    let mut st = state().lock().unwrap();
+    let mut st = state_lock();
     if let Some(r) = st.requests.get_mut(&handle) {
         if !data.is_null() && len > 0 && len <= 2 * 1024 * 1024 {
             r.body = std::slice::from_raw_parts(data, len as usize).to_vec();
@@ -870,7 +887,13 @@ unsafe extern "system" fn set_raw_body(
     }
 }
 
-unsafe extern "system" fn set_cookie(_this: *mut c_void, _c: u32, _h: *const c_char, _n: *const c_char, _v: *const c_char) -> u8 {
+unsafe extern "system" fn set_cookie(
+    _this: *mut c_void,
+    _c: u32,
+    _h: *const c_char,
+    _n: *const c_char,
+    _v: *const c_char,
+) -> u8 {
     1
 }
 
@@ -899,7 +922,7 @@ unsafe extern "system" fn was_timeout(_this: *mut c_void, _h: u32, out: *mut u8)
 
 unsafe extern "system" fn utils_is_completed(this: *mut c_void, call: u64, failed: *mut u8) -> u8 {
     {
-        let st = state().lock().unwrap();
+        let st = state_lock();
         if let Some(c) = st.calls.get(&call) {
             if !failed.is_null() {
                 *failed = if c.failed { 1 } else { 0 };
@@ -922,7 +945,7 @@ unsafe extern "system" fn utils_get_result(
     failed: *mut u8,
 ) -> u8 {
     let (handle, call_failed, context, status, body_len, ok) = {
-        let st = state().lock().unwrap();
+        let st = state_lock();
         match st.calls.get(&call) {
             Some(c) => {
                 let r = st.requests.get(&c.request);
@@ -951,7 +974,10 @@ unsafe extern "system" fn utils_get_result(
         return 0;
     }
     if callback.is_null() || cub < 28 {
-        log_msg(&format!("GetAPICallResult reject cub={} expected={}", cub, expected));
+        log_msg(&format!(
+            "GetAPICallResult reject cub={} expected={}",
+            cub, expected
+        ));
         return 0;
     }
     let packed = pack_http_completed(handle, context, ok, status, body_len);
@@ -974,7 +1000,7 @@ unsafe extern "system" fn hook_run_callbacks() {
 
 unsafe extern "system" fn hook_reg_call(cb: *mut c_void, call: u64) {
     if !cb.is_null() && call != 0 {
-        state().lock().unwrap().call_results.insert(call, cb as usize);
+        state_lock().call_results.insert(call, cb as usize);
         debug_log(&format!("RegisterCallResult call={:#x} cb={:p}", call, cb));
     }
     if let Some(orig) = ORIG_REG_CALL.get() {
@@ -983,7 +1009,7 @@ unsafe extern "system" fn hook_reg_call(cb: *mut c_void, call: u64) {
 }
 
 unsafe extern "system" fn hook_unreg_call(cb: *mut c_void, call: u64) {
-    state().lock().unwrap().call_results.remove(&call);
+    state_lock().call_results.remove(&call);
     if let Some(orig) = ORIG_UNREG_CALL.get() {
         orig(cb, call);
     }
@@ -991,7 +1017,7 @@ unsafe extern "system" fn hook_unreg_call(cb: *mut c_void, call: u64) {
 
 fn dispatch_http_callresults() {
     let jobs: Vec<(u64, usize, [u8; 32], u8)> = {
-        let mut st = state().lock().unwrap();
+        let mut st = state_lock();
         let mut out = Vec::new();
         let calls: Vec<u64> = st.calls.keys().copied().collect();
         for call in calls {
@@ -1034,7 +1060,10 @@ fn dispatch_http_callresults() {
                 std::mem::transmute(*slots.add(1));
             let mut buf = packed;
             run(obj, buf.as_mut_ptr(), failed, call);
-            debug_log(&format!("dispatched HTTPRequestCompleted_t call={:#x}", call));
+            debug_log(&format!(
+                "dispatched HTTPRequestCompleted_t call={:#x}",
+                call
+            ));
         }
     }
 }
@@ -1043,69 +1072,18 @@ fn dispatch_http_callresults() {
 /// `module` must be the base of a live, loaded PE image (or null); its headers and import
 /// tables stay mapped for the process lifetime. `new` must be an `extern "system"` function
 /// whose ABI matches `func`.
+/// Patch one import slot, logging why a patch did not happen. The walk itself (and its
+/// bounds checks) lives in `pe.rs`; `None` is the normal outcome for an import this build
+/// does not use, and a non-`NotFound` error is worth a line in the shim log.
 unsafe fn iat_replace(module: *mut u8, dll: &str, func: &str, new: usize) -> Option<usize> {
-    if module.is_null() {
-        return None;
-    }
-    let e_lfanew = *(module.add(0x3C) as *const u32) as usize;
-    let opt = module.add(e_lfanew + 24);
-    let magic = *(opt as *const u16);
-    if magic != 0x20b {
-        return None;
-    }
-    let import_rva = *(opt.add(120) as *const u32) as usize;
-    if import_rva == 0 {
-        return None;
-    }
-    let mut desc = module.add(import_rva);
-    for _desc in 0..256 {
-        let orig_thunk = *(desc as *const u32);
-        let name_rva = *(desc.add(12) as *const u32);
-        let first_thunk = *(desc.add(16) as *const u32);
-        if name_rva == 0 && first_thunk == 0 {
-            break;
+    match pe::replace(module, dll, func, new) {
+        Ok(old) => Some(old),
+        Err(pe::IatError::NotFound) => None,
+        Err(e) => {
+            debug_log(&format!("iat_replace {dll}!{func} failed: {e:?}"));
+            None
         }
-        let iname = {
-            let p = module.add(name_rva as usize) as *const i8;
-            let mut n = 0usize;
-            while n < 128 && *p.add(n) != 0 {
-                n += 1;
-            }
-            String::from_utf8_lossy(std::slice::from_raw_parts(p as *const u8, n)).to_lowercase()
-        };
-        if iname == dll {
-            let ilt_rva = if orig_thunk != 0 { orig_thunk } else { first_thunk };
-            let mut ilt = module.add(ilt_rva as usize) as *mut u64;
-            let mut iat = module.add(first_thunk as usize) as *mut u64;
-            for _thunk in 0..4096 {
-                if *ilt == 0 {
-                    break;
-                }
-                if *ilt & (1u64 << 63) == 0 {
-                    let fname = {
-                        let p = module.add((*ilt as usize) + 2) as *const i8;
-                        let mut n = 0usize;
-                        while n < 128 && *p.add(n) != 0 {
-                            n += 1;
-                        }
-                        String::from_utf8_lossy(std::slice::from_raw_parts(p as *const u8, n)).into_owned()
-                    };
-                    if fname == func {
-                        let old = *iat as usize;
-                        let mut prot = 0u32;
-                        VirtualProtect(iat as *mut c_void, 8, PAGE_EXECUTE_READWRITE, &mut prot);
-                        *iat = new as u64;
-                        VirtualProtect(iat as *mut c_void, 8, prot, &mut prot);
-                        return Some(old);
-                    }
-                }
-                ilt = ilt.add(1);
-                iat = iat.add(1);
-            }
-        }
-        desc = desc.add(20);
     }
-    None
 }
 
 unsafe extern "C" fn hook_svc_cfg(
@@ -1115,7 +1093,10 @@ unsafe extern "C" fn hook_svc_cfg(
 ) -> i32 {
     let ep = from_c(endpoint);
     let t = from_c(title);
-    debug_log(&format!("PFServiceConfigCreateHandle ep={} title={}", ep, t));
+    debug_log(&format!(
+        "PFServiceConfigCreateHandle ep={} title={}",
+        ep, t
+    ));
     let rewrite = CString::new(lan_cfg().origin()).unwrap();
     if let Some(orig) = ORIG_SVC_CFG.get() {
         return orig(rewrite.as_ptr(), title, handle);
@@ -1137,27 +1118,14 @@ fn hook_playfab_iat() {
             "PFServiceConfigCreateHandle",
             hook_svc_cfg as *const () as usize,
         ) {
-            let _ = ORIG_SVC_CFG.set(std::mem::transmute(old));
+            let _ = ORIG_SVC_CFG.set(std::mem::transmute::<
+                usize,
+                unsafe extern "C" fn(*const c_char, *const c_char, *mut *mut c_void) -> i32,
+            >(old));
             debug_log(&format!("IAT PFServiceConfigCreateHandle {:#x}", old));
         } else {
             log_msg("IAT PFServiceConfigCreateHandle not found");
         }
-    }
-}
-
-fn from_wide(p: *const u16) -> String {
-    if p.is_null() {
-        return String::new();
-    }
-    unsafe {
-        let mut n = 0usize;
-        while *p.add(n) != 0 {
-            n += 1;
-            if n > 512 {
-                break;
-            }
-        }
-        String::from_utf16_lossy(std::slice::from_raw_parts(p, n))
     }
 }
 
@@ -1256,31 +1224,33 @@ fn hook_winhttp_modules() {
     // SAFETY: modules are resolved by name from the loader; iat_replace validates each import
     // descriptor before writing, and every replacement has the WinHTTP ABI.
     unsafe {
-        let w = GetModuleHandleA(b"winhttp.dll\0".as_ptr());
+        let w = GetModuleHandleA(c"winhttp.dll".as_ptr());
         if w.is_null() {
             return;
         }
         if ORIG_WH_CONNECT.get().is_none() {
-            let c = GetProcAddress(w, b"WinHttpConnect\0".as_ptr());
-            let s = GetProcAddress(w, b"WinHttpSendRequest\0".as_ptr());
-            let o = GetProcAddress(w, b"WinHttpOpenRequest\0".as_ptr());
+            let c = GetProcAddress(w, c"WinHttpConnect".as_ptr());
+            let s = GetProcAddress(w, c"WinHttpSendRequest".as_ptr());
+            let o = GetProcAddress(w, c"WinHttpOpenRequest".as_ptr());
             if !c.is_null() {
-                let _ = ORIG_WH_CONNECT.set(std::mem::transmute(c));
+                let _ =
+                    ORIG_WH_CONNECT.set(std::mem::transmute::<*mut c_void, WinHttpConnectFn>(c));
             }
             if !s.is_null() {
-                let _ = ORIG_WH_SEND.set(std::mem::transmute(s));
+                let _ = ORIG_WH_SEND.set(std::mem::transmute::<*mut c_void, WinHttpSendFn>(s));
             }
             if !o.is_null() {
-                let _ = ORIG_WH_OPEN.set(std::mem::transmute(o));
+                let _ =
+                    ORIG_WH_OPEN.set(std::mem::transmute::<*mut c_void, WinHttpOpenRequestFn>(o));
             }
         }
         if ORIG_WH_CONNECT.get().is_none() || ORIG_WH_SEND.get().is_none() {
             return;
         }
         for name in [
-            b"PlayFabCore.Win32.dll\0".as_ptr(),
-            b"libHttpClient.Win32.dll\0".as_ptr(),
-            b"PlayFabServices.Win32.dll\0".as_ptr(),
+            c"PlayFabCore.Win32.dll".as_ptr(),
+            c"libHttpClient.Win32.dll".as_ptr(),
+            c"PlayFabServices.Win32.dll".as_ptr(),
             ptr::null(),
         ] {
             let m = GetModuleHandleA(name) as *mut u8;
@@ -1335,9 +1305,11 @@ fn hook_steam_iat() {
             exe,
             "steam_api64.dll",
             "SteamAPI_RunCallbacks",
-            hook_run_callbacks as usize,
+            hook_run_callbacks as *const () as usize,
         ) {
-            let _ = ORIG_RUN_CALLBACKS.set(std::mem::transmute(old));
+            let _ = ORIG_RUN_CALLBACKS.set(
+                std::mem::transmute::<usize, unsafe extern "system" fn()>(old),
+            );
             debug_log(&format!("IAT SteamAPI_RunCallbacks {:#x}", old));
         } else {
             log_msg("IAT SteamAPI_RunCallbacks not found");
@@ -1346,9 +1318,12 @@ fn hook_steam_iat() {
             exe,
             "steam_api64.dll",
             "SteamAPI_RegisterCallResult",
-            hook_reg_call as usize,
+            hook_reg_call as *const () as usize,
         ) {
-            let _ = ORIG_REG_CALL.set(std::mem::transmute(old));
+            let _ = ORIG_REG_CALL.set(std::mem::transmute::<
+                usize,
+                unsafe extern "system" fn(*mut c_void, u64),
+            >(old));
             debug_log(&format!("IAT SteamAPI_RegisterCallResult {:#x}", old));
         } else {
             log_msg("IAT SteamAPI_RegisterCallResult not found");
@@ -1357,17 +1332,23 @@ fn hook_steam_iat() {
             exe,
             "steam_api64.dll",
             "SteamAPI_UnregisterCallResult",
-            hook_unreg_call as usize,
+            hook_unreg_call as *const () as usize,
         ) {
-            let _ = ORIG_UNREG_CALL.set(std::mem::transmute(old));
+            let _ = ORIG_UNREG_CALL.set(std::mem::transmute::<
+                usize,
+                unsafe extern "system" fn(*mut c_void, u64),
+            >(old));
         }
         if let Some(old) = iat_replace(
             exe,
             "steam_api64.dll",
             "SteamAPI_RegisterCallback",
-            hook_reg_cb as usize,
+            hook_reg_cb as *const () as usize,
         ) {
-            let _ = ORIG_REG_CB.set(std::mem::transmute(old));
+            let _ = ORIG_REG_CB.set(std::mem::transmute::<
+                usize,
+                unsafe extern "system" fn(*mut c_void, i32),
+            >(old));
             debug_log(&format!("IAT SteamAPI_RegisterCallback {:#x}", old));
         } else {
             log_msg("IAT SteamAPI_RegisterCallback not found");
@@ -1376,9 +1357,12 @@ fn hook_steam_iat() {
             exe,
             "steam_api64.dll",
             "SteamAPI_UnregisterCallback",
-            hook_unreg_cb as usize,
+            hook_unreg_cb as *const () as usize,
         ) {
-            let _ = ORIG_UNREG_CB.set(std::mem::transmute(old));
+            let _ = ORIG_UNREG_CB.set(std::mem::transmute::<
+                usize,
+                unsafe extern "system" fn(*mut c_void),
+            >(old));
         }
     }
 }
@@ -1432,17 +1416,17 @@ fn http_vtable() -> *mut *mut c_void {
 
 fn try_patch() -> bool {
     unsafe {
-        let steam = GetModuleHandleA(b"steam_api64.dll\0".as_ptr());
+        let steam = GetModuleHandleA(c"steam_api64.dll".as_ptr());
         if steam.is_null() {
             return false;
         }
-        let init = GetProcAddress(steam, b"SteamAPI_Init\0".as_ptr());
-        let find = GetProcAddress(steam, b"SteamInternal_FindOrCreateUserInterface\0".as_ptr());
-        let huser_fn = GetProcAddress(steam, b"SteamAPI_GetHSteamUser\0".as_ptr());
+        let init = GetProcAddress(steam, c"SteamAPI_Init".as_ptr());
+        let find = GetProcAddress(steam, c"SteamInternal_FindOrCreateUserInterface".as_ptr());
+        let huser_fn = GetProcAddress(steam, c"SteamAPI_GetHSteamUser".as_ptr());
         if init.is_null() || find.is_null() || huser_fn.is_null() {
             return false;
         }
-        type FindFn = unsafe extern "system" fn(i32, *const u8) -> *mut c_void;
+        type FindFn = unsafe extern "system" fn(i32, *const c_char) -> *mut c_void;
         type HUserFn = unsafe extern "system" fn() -> i32;
         // SAFETY: both symbols were resolved from steam_api64.dll; these are their documented
         // Steamworks signatures.
@@ -1452,10 +1436,10 @@ fn try_patch() -> bool {
         let mut http = ptr::null_mut();
         let mut utils = ptr::null_mut();
         for user in [reported, 1, 0] {
-            http = find(user, b"STEAMHTTP_INTERFACE_VERSION003\0".as_ptr());
-            utils = find(user, b"SteamUtils010\0".as_ptr());
+            http = find(user, c"STEAMHTTP_INTERFACE_VERSION003".as_ptr());
+            utils = find(user, c"SteamUtils010".as_ptr());
             if utils.is_null() {
-                utils = find(user, b"SteamUtils009\0".as_ptr());
+                utils = find(user, c"SteamUtils009".as_ptr());
             }
             if !http.is_null() && !utils.is_null() {
                 break;
@@ -1473,15 +1457,25 @@ fn try_patch() -> bool {
         let is_c = *uv.add(UTILS_IS_CALL_COMPLETED);
         let get_r = *uv.add(UTILS_GET_CALL_RESULT);
         let _ = ORIG_UTILS.set(UtilsOrig {
-            is_completed: std::mem::transmute(is_c),
-            get_result: std::mem::transmute(get_r),
+            is_completed: std::mem::transmute::<
+                *mut c_void,
+                unsafe extern "system" fn(*mut c_void, u64, *mut u8) -> u8,
+            >(is_c),
+            get_result: std::mem::transmute::<
+                *mut c_void,
+                unsafe extern "system" fn(*mut c_void, u64, *mut u8, i32, i32, *mut u8) -> u8,
+            >(get_r),
         });
-        patch_slot(uv, UTILS_IS_CALL_COMPLETED, utils_is_completed as *mut c_void);
+        patch_slot(
+            uv,
+            UTILS_IS_CALL_COMPLETED,
+            utils_is_completed as *mut c_void,
+        );
         patch_slot(uv, UTILS_GET_CALL_RESULT, utils_get_result as *mut c_void);
         for ver in [
-            b"SteamUser023\0".as_ptr(),
-            b"SteamUser022\0".as_ptr(),
-            b"SteamUser021\0".as_ptr(),
+            c"SteamUser023".as_ptr(),
+            c"SteamUser022".as_ptr(),
+            c"SteamUser021".as_ptr(),
         ] {
             let mut user = ptr::null_mut();
             for uid in [reported, 1, 0] {
@@ -1496,15 +1490,25 @@ fn try_patch() -> bool {
             let uvt = *(user as *mut *mut c_void) as *mut *mut c_void;
             let orig_web = *uvt.add(USER_GET_AUTH_TICKET_WEBAPI);
             if !orig_web.is_null() {
-                let _ = ORIG_WEBAPI.set(std::mem::transmute(orig_web));
+                let _ = ORIG_WEBAPI.set(std::mem::transmute::<
+                    *mut c_void,
+                    unsafe extern "system" fn(*mut c_void, *const c_char) -> u32,
+                >(orig_web));
             }
             patch_slot(uvt, USER_BLOGGED_ON, blogged_on as *mut c_void);
-            patch_slot(uvt, USER_GET_AUTH_TICKET_WEBAPI, get_auth_ticket_webapi as *mut c_void);
+            patch_slot(
+                uvt,
+                USER_GET_AUTH_TICKET_WEBAPI,
+                get_auth_ticket_webapi as *mut c_void,
+            );
             debug_log(&format!("patched ISteamUser at {:p}", user));
             break;
         }
         hook_winhttp_modules();
-        debug_log(&format!("patched ISteamHTTP at {:p} and SteamUtils at {:p}", http, utils));
+        debug_log(&format!(
+            "patched ISteamHTTP at {:p} and SteamUtils at {:p}",
+            http, utils
+        ));
         true
     }
 }
@@ -1525,11 +1529,11 @@ fn patch_thread() {
         }
         if i % 50 == 0 {
             unsafe {
-                let steam = GetModuleHandleA(b"steam_api64.dll\0".as_ptr());
+                let steam = GetModuleHandleA(c"steam_api64.dll".as_ptr());
                 let huser_fn = if steam.is_null() {
                     ptr::null_mut()
                 } else {
-                    GetProcAddress(steam, b"SteamAPI_GetHSteamUser\0".as_ptr())
+                    GetProcAddress(steam, c"SteamAPI_GetHSteamUser".as_ptr())
                 };
                 let user = if huser_fn.is_null() {
                     -1
@@ -1565,7 +1569,7 @@ static SYS_VERSION: OnceLock<usize> = OnceLock::new();
 /// # Safety
 /// `name` must be a NUL-terminated ASCII export name. The handle comes from
 /// `load_sys_version` and remains valid; a failed load yields null, which is rejected here.
-unsafe fn sys_proc(name: &[u8]) -> *mut c_void {
+unsafe fn sys_proc(name: &CStr) -> *mut c_void {
     let h = *SYS_VERSION.get().unwrap_or(&0) as *mut c_void;
     if h.is_null() {
         return ptr::null_mut();
@@ -1579,7 +1583,10 @@ unsafe extern "C" fn on_load() {
     }
     let sys = load_sys_version();
     let _ = SYS_VERSION.set(sys as usize);
-    debug_log(concat!("loaded version.dll proxy build=", env!("BUILD_STAMP")));
+    debug_log(concat!(
+        "loaded version.dll proxy build=",
+        env!("BUILD_STAMP")
+    ));
     hook_steam_iat();
     hook_playfab_iat();
     hook_winhttp_modules();
@@ -1591,79 +1598,139 @@ unsafe extern "C" fn on_load() {
 static INIT: unsafe extern "C" fn() = on_load;
 
 // VERSION.dll forwards (four-usize thunks cover the real APIs).
+/// `version.dll` forwarder: the real system function is looked up and called with these
+/// arguments verbatim.
+///
+/// # Safety
+/// The caller is the loader or a `version.dll` consumer, so the arguments must satisfy the real
+/// function's contract; the return value follows the same pointer-lifetime rules.
 #[no_mangle]
 pub unsafe extern "system" fn GetFileVersionInfoA(a: usize, b: usize, c: usize, d: usize) -> usize {
-    let p = sys_proc(b"GetFileVersionInfoA\0");
+    let p = sys_proc(c"GetFileVersionInfoA");
     if p.is_null() {
         return 0;
     }
     let f: unsafe extern "system" fn(usize, usize, usize, usize) -> usize = std::mem::transmute(p);
     f(a, b, c, d)
 }
+/// `version.dll` forwarder: the real system function is looked up and called with these
+/// arguments verbatim.
+///
+/// # Safety
+/// The caller is the loader or a `version.dll` consumer, so the arguments must satisfy the real
+/// function's contract; the return value follows the same pointer-lifetime rules.
 #[no_mangle]
 pub unsafe extern "system" fn GetFileVersionInfoW(a: usize, b: usize, c: usize, d: usize) -> usize {
-    let p = sys_proc(b"GetFileVersionInfoW\0");
+    let p = sys_proc(c"GetFileVersionInfoW");
     if p.is_null() {
         return 0;
     }
     let f: unsafe extern "system" fn(usize, usize, usize, usize) -> usize = std::mem::transmute(p);
     f(a, b, c, d)
 }
+/// `version.dll` forwarder: the real system function is looked up and called with these
+/// arguments verbatim.
+///
+/// # Safety
+/// The caller is the loader or a `version.dll` consumer, so the arguments must satisfy the real
+/// function's contract; the return value follows the same pointer-lifetime rules.
 #[no_mangle]
 pub unsafe extern "system" fn GetFileVersionInfoSizeA(a: usize, b: usize) -> usize {
-    let p = sys_proc(b"GetFileVersionInfoSizeA\0");
+    let p = sys_proc(c"GetFileVersionInfoSizeA");
     if p.is_null() {
         return 0;
     }
     let f: unsafe extern "system" fn(usize, usize) -> usize = std::mem::transmute(p);
     f(a, b)
 }
+/// `version.dll` forwarder: the real system function is looked up and called with these
+/// arguments verbatim.
+///
+/// # Safety
+/// The caller is the loader or a `version.dll` consumer, so the arguments must satisfy the real
+/// function's contract; the return value follows the same pointer-lifetime rules.
 #[no_mangle]
 pub unsafe extern "system" fn GetFileVersionInfoSizeW(a: usize, b: usize) -> usize {
-    let p = sys_proc(b"GetFileVersionInfoSizeW\0");
+    let p = sys_proc(c"GetFileVersionInfoSizeW");
     if p.is_null() {
         return 0;
     }
     let f: unsafe extern "system" fn(usize, usize) -> usize = std::mem::transmute(p);
     f(a, b)
 }
+/// `version.dll` forwarder: the real system function is looked up and called with these
+/// arguments verbatim.
+///
+/// # Safety
+/// The caller is the loader or a `version.dll` consumer, so the arguments must satisfy the real
+/// function's contract; the return value follows the same pointer-lifetime rules.
 #[no_mangle]
 pub unsafe extern "system" fn VerQueryValueA(a: usize, b: usize, c: usize, d: usize) -> usize {
-    let p = sys_proc(b"VerQueryValueA\0");
+    let p = sys_proc(c"VerQueryValueA");
     if p.is_null() {
         return 0;
     }
     let f: unsafe extern "system" fn(usize, usize, usize, usize) -> usize = std::mem::transmute(p);
     f(a, b, c, d)
 }
+/// `version.dll` forwarder: the real system function is looked up and called with these
+/// arguments verbatim.
+///
+/// # Safety
+/// The caller is the loader or a `version.dll` consumer, so the arguments must satisfy the real
+/// function's contract; the return value follows the same pointer-lifetime rules.
 #[no_mangle]
 pub unsafe extern "system" fn VerQueryValueW(a: usize, b: usize, c: usize, d: usize) -> usize {
-    let p = sys_proc(b"VerQueryValueW\0");
+    let p = sys_proc(c"VerQueryValueW");
     if p.is_null() {
         return 0;
     }
     let f: unsafe extern "system" fn(usize, usize, usize, usize) -> usize = std::mem::transmute(p);
     f(a, b, c, d)
 }
+/// `version.dll` forwarder: the real system function is looked up and called with these
+/// arguments verbatim.
+///
+/// # Safety
+/// The caller is the loader or a `version.dll` consumer, so the arguments must satisfy the real
+/// function's contract; the return value follows the same pointer-lifetime rules.
 #[no_mangle]
 pub unsafe extern "system" fn GetFileVersionInfoSizeExW(a: usize, b: usize, c: usize) -> usize {
-    let p = sys_proc(b"GetFileVersionInfoSizeExW\0");
+    let p = sys_proc(c"GetFileVersionInfoSizeExW");
     if p.is_null() {
         return 0;
     }
     let f: unsafe extern "system" fn(usize, usize, usize) -> usize = std::mem::transmute(p);
     f(a, b, c)
 }
+/// `version.dll` forwarder: the real system function is looked up and called with these
+/// arguments verbatim.
+///
+/// # Safety
+/// The caller is the loader or a `version.dll` consumer, so the arguments must satisfy the real
+/// function's contract; the return value follows the same pointer-lifetime rules.
 #[no_mangle]
-pub unsafe extern "system" fn GetFileVersionInfoExW(a: usize, b: usize, c: usize, d: usize, e: usize) -> usize {
-    let p = sys_proc(b"GetFileVersionInfoExW\0");
+pub unsafe extern "system" fn GetFileVersionInfoExW(
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+    e: usize,
+) -> usize {
+    let p = sys_proc(c"GetFileVersionInfoExW");
     if p.is_null() {
         return 0;
     }
-    let f: unsafe extern "system" fn(usize, usize, usize, usize, usize) -> usize = std::mem::transmute(p);
+    let f: unsafe extern "system" fn(usize, usize, usize, usize, usize) -> usize =
+        std::mem::transmute(p);
     f(a, b, c, d, e)
 }
 
+/// DllMain for the `version.dll` proxy: runs the patch sequence on process attach.
+///
+/// # Safety
+/// Called by the loader with the standard DllMain contract; `reason` and the reserved argument
+/// come from the loader.
 #[no_mangle]
 pub unsafe extern "system" fn DllMain(_mod: *mut c_void, reason: u32, _res: *mut c_void) -> i32 {
     if reason == DLL_PROCESS_ATTACH {

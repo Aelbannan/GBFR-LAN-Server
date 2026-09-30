@@ -6,8 +6,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_char, c_void, CString};
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -19,7 +19,28 @@ include!("../../common/lan_cfg.rs");
 /// `reliable_test.rs` so the simulated loss/duplication/reordering tests exercise the shipping
 /// code. See `src/reliable.rs` for the PartySendMessageOptions semantics implemented here.
 mod reliable;
+
+/// Pure UDP wire format and payload helpers, with its own test binary
+/// (`tests/wire_test.rs`). The header offsets the send path writes and the receive path
+/// reads are asserted there in both protocol versions.
+mod wire;
 use reliable::RecvOutcome;
+use wire::{
+    hex_preview, ip_string, is_chara_snapshot, is_loopback_ip, parse_lan1, payload_hints,
+    truncate_log, u32le, KIND_ACK, KIND_HELLO, KIND_MSG,
+};
+
+/// Shared blocking HTTP client, bounded on both ends (`common/http.rs`; tests in
+/// `common/http_test.rs`). One copy for both shims so the connect/read caps cannot drift.
+#[path = "../../common/http.rs"]
+mod http;
+
+/// Shared std-only JSON accessors, compiled from `common/json.rs`. Companion test:
+/// `common/json_test.rs`. Both shims and the test build the same file, so these parsers
+/// cannot drift apart the way the two hand-rolled copies did.
+#[path = "../../common/json.rs"]
+mod json;
+use json::{json_arr_objects, json_str};
 
 const SUCCESS: u32 = 0;
 const ERR: u32 = 0x8000_4005;
@@ -28,10 +49,6 @@ const IDENT_LEN: usize = 37;
 const REGION_LEN: usize = 20;
 const OPAQUE_LEN: usize = 300;
 const SERIALIZED_MAX: usize = 449;
-const MAGIC: &[u8; 4] = b"GBFR";
-const KIND_HELLO: u8 = 1;
-const KIND_MSG: u8 = 2;
-const KIND_ACK: u8 = 3;
 
 /// Idle poll interval of the transport thread. An enqueue wakes the thread immediately through
 /// the outbox condvar, so this only bounds how quickly unsolicited inbound datagrams are noticed
@@ -75,11 +92,8 @@ const LOG_REOPEN_MS: u128 = 5000;
 /// sequence number; v2 (56) carried both; v3 (60) adds the cumulative guaranteed-space ack for
 /// the real guaranteed-delivery implementation. With `PARTY_RELIABLE = false` the shim keeps the
 /// exact v2 wire format it shipped before, so disabling reliability restores the old behaviour.
-const HDR_LEN: usize = if reliable::PARTY_RELIABLE { 60 } else { 56 };
-const HDR_VERSION: u8 = if reliable::PARTY_RELIABLE { 3 } else { 2 };
-/// Offset of the cumulative guaranteed-space ack in the v3 header.
-const HDR_ACK_OFF: usize = 56;
-
+const HDR_LEN: usize = wire::header_len(reliable::PARTY_RELIABLE);
+const HDR_VERSION: u8 = wire::version(reliable::PARTY_RELIABLE);
 /// `PartyMessageReceivedOptions` — describes what the library *actually did* when delivering the
 /// message, not what the sender asked for (see the Party transport-options docs).
 const RECV_GUARANTEED: u32 = 0x1;
@@ -404,7 +418,10 @@ fn thread_probe_note() -> String {
     while i < THREAD_SLOTS {
         let t = THREAD_TIDS[i].load(Ordering::Relaxed);
         if t != 0 {
-            parts.push(format!("{t:#x}:{}", THREAD_COUNTS[i].load(Ordering::Relaxed)));
+            parts.push(format!(
+                "{t:#x}:{}",
+                THREAD_COUNTS[i].load(Ordering::Relaxed)
+            ));
         }
         i += 1;
     }
@@ -516,14 +533,7 @@ fn note_eventbus() {
         }
         t.last = Some(v);
         (
-            changed,
-            first,
-            prev,
-            count,
-            t.distinct,
-            t.seen,
-            t.missing,
-            t.overflow,
+            changed, first, prev, count, t.distinct, t.seen, t.missing, t.overflow,
         )
     };
     if !changed {
@@ -631,54 +641,6 @@ fn log_wire_mismatch(src: &SocketAddr, len: usize, preview: &[u8]) {
     ));
 }
 
-fn u32le(data: &[u8], off: usize) -> Option<u32> {
-    data.get(off..off + 4)
-        .and_then(|b| b.try_into().ok())
-        .map(u32::from_le_bytes)
-}
-
-fn hex_preview(data: &[u8], n: usize) -> String {
-    data.iter()
-        .take(n)
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn payload_hints(data: &[u8]) -> String {
-    let len = data.len();
-    let op = u32le(data, 0);
-    let sub = u32le(data, 4);
-    let slot = u32le(data, 0x10);
-    let mut tags = Vec::new();
-    if let Some(op) = op {
-        tags.push(format!("op={op}"));
-        if op == 2 {
-            tags.push("dispatch".into());
-        }
-    }
-    if let Some(sub) = sub {
-        tags.push(format!("sub={sub}"));
-    }
-    if let Some(slot) = slot {
-        if slot <= 3 {
-            tags.push(format!("dword@+10={slot}"));
-        }
-        if slot == 4 {
-            tags.push("WATCH_4 dword@+10=4".into());
-        }
-    }
-    // Human apply memcpy is 0x3578 in-memory; wire blob is 0x2FC.
-    if (0x2FC..0x2FC + 48).contains(&len) {
-        tags.push("sz~0x2FC_chara".into());
-    }
-    // CPU: u32 slot @ +0x10, blob 0x2FC @ +0x14, name[40].
-    if (0x14 + 0x2FC..0x14 + 0x2FC + 48).contains(&len) {
-        tags.push("sz~cpu_chara".into());
-    }
-    tags.join(" ")
-}
-
 fn log_hex_all() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| {
@@ -702,12 +664,14 @@ fn should_log_payload(key: &str) -> bool {
     *n <= 16 || *n == 50 || *n == 100 || *n % 250 == 0
 }
 
+/// Per-opcode message counters plus the rollup instant: `(send, recv, sent_ops, recv_ops,
+/// last_rollup)`. A named type keeps the counters and the periodic rollup in one place.
+type MsgStats = Mutex<(u64, u64, HashMap<u32, u64>, HashMap<u32, u64>, Instant)>;
+
 fn bump_msg_stats(dir: &str, opcode: u32) {
-    static STATS: OnceLock<Mutex<(u64, u64, HashMap<u32, u64>, HashMap<u32, u64>, Instant)>> =
-        OnceLock::new();
-    let stats = STATS.get_or_init(|| {
-        Mutex::new((0, 0, HashMap::new(), HashMap::new(), Instant::now()))
-    });
+    static STATS: OnceLock<MsgStats> = OnceLock::new();
+    let stats =
+        STATS.get_or_init(|| Mutex::new((0, 0, HashMap::new(), HashMap::new(), Instant::now())));
     let Ok(mut g) = stats.lock() else {
         return;
     };
@@ -800,20 +764,60 @@ fn log_payload(dir: &str, extra: &str, payload: &[u8]) {
     }
     // Q7: op-2 payloads carry the quest id (sub 0x5A, +0x14) and the chara blobs, but we only ever
     // logged their first 16 bytes, which hid exactly the fields the quest-start diagnosis needs.
-    let nhex = payload.len().min(72);
+    // P0 quest-sync raise (IMPL-2 item 2; QUEST_SEQUENCE_GAP Q7 / 6P-MESH-UI Q7+H4): op-2 sub-0x5A
+    // (24 B: ordinal +0x10, quest id +0x14) and op-3 sub-0xC (72 B: four member ordinals
+    // +0x38..+0x47) / sub-0xD (496 B: per-member blocks) / sub-0xE (784 B: chara blob, ordinal
+    // +0x2B4, name +0x2DA, flag +0x30C) are one-shot guaranteed control -- never the high-rate
+    // op-5 sub-3 / op-6 sub-1 streams -- so their hex cap is raised to 1024 B (covers the largest
+    // known, 784 B sub-0xE, in full). Every other opcode keeps the 72 B cap as today. Log-only:
+    // line count and sampling are unchanged (still under `should_log_payload` above).
+    let is_quest_sync = (op == 2 && sub == 0x5A) || (op == 3 && matches!(sub, 0xC..=0xE));
+    let nhex = if is_quest_sync {
+        payload.len().min(1024)
+    } else {
+        payload.len().min(72)
+    };
     let ent = if op == 3 {
         opcode3_entity(payload)
     } else {
         String::new()
     };
+    // Decoded quest fields ride the same (already sampled) line: no new line volume. Sub-0xD
+    // per-member blocks have no single documented ordinal offset, so full hex alone carries them.
+    let quest = if op == 2 && sub == 0x5A {
+        format!(
+            " ord@+10={} quest@+14={}",
+            u32le(payload, 0x10).map_or("?".to_string(), |v| v.to_string()),
+            u32le(payload, 0x14).map_or("?".to_string(), |v| v.to_string())
+        )
+    } else if op == 3 && sub == 0xC {
+        let m: Vec<String> = (0..4)
+            .map(|i| u32le(payload, 0x38 + i * 4).map_or("?".to_string(), |v| v.to_string()))
+            .collect();
+        format!(" members@+38=[{}]", m.join(","))
+    } else if op == 3 && sub == 0xE {
+        format!(
+            " ord@+2B4={} flag@+30C={}",
+            u32le(payload, 0x2B4).map_or("?".to_string(), |v| v.to_string()),
+            payload
+                .get(0x30C)
+                .map_or("?".to_string(), |v| v.to_string())
+        )
+    } else {
+        String::new()
+    };
     debug_log(&format!(
-        "{dir}_hex opcode={op} len={} {} {}{} hex=[{}]",
+        "{dir}_hex opcode={op} len={} {} {}{}{} hex=[{}]",
         payload.len(),
         extra,
         payload_hints(payload),
         ent,
+        quest,
         hex_preview(payload, nhex)
     ));
+    // P0 join-publish identity (IMPL-2 item 1): same debug gate + per-payload call, own 128-line
+    // backstop inside `log_join_publish`. Log-only; never touches `payload`, branches, or emit.
+    log_join_publish(dir, extra, payload);
 }
 
 fn opcode3_entity(payload: &[u8]) -> String {
@@ -821,7 +825,12 @@ fn opcode3_entity(payload: &[u8]) -> String {
         return String::new();
     }
     let raw = &payload[0x22..];
-    let s: Vec<u8> = raw.iter().copied().take_while(|b| *b != 0).take(32).collect();
+    let s: Vec<u8> = raw
+        .iter()
+        .copied()
+        .take_while(|b| *b != 0)
+        .take(32)
+        .collect();
     if s.is_empty() {
         return " ent@+22=empty".into();
     }
@@ -832,15 +841,69 @@ fn opcode3_entity(payload: &[u8]) -> String {
     }
 }
 
+/// P0 join-publish identity log (IMPL-2 item 1; 6P-GROUND-TAB §3.T5/§5.5 four-field spec).
+/// Log-only. Gate (join events only, never per-frame): op-3 sub-7 chara publish (0xC8 class)
+/// or an op-2 chara snapshot (>= 600 B per `is_chara_snapshot`; the 0x2FC human/CPU windows in
+/// `payload_hints` are a subset of this for op 2). High-rate op-5 sub-3 / op-6 sub-1 never
+/// match. Per matching payload (one-shot per member per join) logs len, u32 at wire +0x00/+0x10,
+/// ASCII name bytes at wire +0x2DA (0x28 cap; `n/a` when the payload is shorter, e.g. sub-7),
+/// and full payload hex (capped at 1024 B, covering the largest known join blob in full).
+/// Called from `log_payload` past its debug gate, so behind `[debug]` like every other hex line.
+/// A 128-line process backstop bounds disk even if the gate ever misfires; overflow is logged
+/// once, not silent. Runs for both send and recv so 2p and 6p runs correlate.
+static JOINPUB_LOGGED: AtomicU64 = AtomicU64::new(0);
+fn log_join_publish(dir: &str, extra: &str, payload: &[u8]) {
+    let op = u32le(payload, 0).unwrap_or(0);
+    let sub = u32le(payload, 4).unwrap_or(0);
+    let len = payload.len();
+    if !((op == 3 && sub == 7) || (op == 2 && len >= 600)) {
+        return;
+    }
+    let n = JOINPUB_LOGGED.fetch_add(1, Ordering::Relaxed);
+    if n >= 128 {
+        if n == 128 {
+            debug_log("joinpub backstop hit (128 join-publish lines); further joinpub suppressed");
+        }
+        return;
+    }
+    let w0 = u32le(payload, 0).map_or("?".to_string(), |v| v.to_string());
+    let w10 = u32le(payload, 0x10).map_or("?".to_string(), |v| v.to_string());
+    let name = if len > 0x2DA {
+        let raw: Vec<u8> = payload[0x2DA..]
+            .iter()
+            .copied()
+            .take_while(|b| *b != 0)
+            .take(0x28)
+            .collect();
+        if raw.is_empty() {
+            "empty".to_string()
+        } else if raw.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+            String::from_utf8_lossy(&raw).into_owned()
+        } else {
+            format!("hex=[{}]", hex_preview(&payload[0x2DA..], 0x28))
+        }
+    } else {
+        format!("n/a(len={len})")
+    };
+    debug_log(&format!(
+        "joinpub {dir} len={len} sub={sub} w+00={w0} w+10={w10} name@+2DA={name} {extra} hex=[{}]",
+        hex_preview(payload, len.min(1024))
+    ));
+}
+
 fn log_remote_count(n: usize, eid: &str, uid: u16) {
     debug_log(&format!(
         "EndpointCreated remote uid={uid} entity={eid} remotes={n}"
     ));
     if n == 4 {
-        debug_log("WATCH_4 remotes=4 (shipping Party maxUserCount; 4 others + local = 5 mesh users)");
+        debug_log(
+            "WATCH_4 remotes=4 (shipping Party maxUserCount; 4 others + local = 5 mesh users)",
+        );
     }
     if n == 5 {
-        debug_log("WATCH_4 remotes=5 (beyond shipping 4-user mesh if exe still sends maxUserCount=4)");
+        debug_log(
+            "WATCH_4 remotes=5 (beyond shipping 4-user mesh if exe still sends maxUserCount=4)",
+        );
     }
 }
 
@@ -884,7 +947,11 @@ unsafe fn readable(p: usize, n: usize) -> bool {
         protect: 0,
         type_: 0,
     };
-    if VirtualQuery(p as *const c_void, &mut info, std::mem::size_of::<MemoryBasicInformation>()) == 0
+    if VirtualQuery(
+        p as *const c_void,
+        &mut info,
+        std::mem::size_of::<MemoryBasicInformation>(),
+    ) == 0
     {
         return false;
     }
@@ -909,12 +976,7 @@ extern "system" {
     fn GetCurrentThreadId() -> u32;
     fn GetModuleHandleA(name: *const u8) -> *mut c_void;
     fn VirtualQuery(addr: *const c_void, info: *mut MemoryBasicInformation, len: usize) -> usize;
-    fn RtlCaptureStackBackTrace(
-        skip: u32,
-        cap: u32,
-        buf: *mut *mut c_void,
-        hash: *mut u32,
-    ) -> u16;
+    fn RtlCaptureStackBackTrace(skip: u32, cap: u32, buf: *mut *mut c_void, hash: *mut u32) -> u16;
 }
 
 #[link(name = "winmm")]
@@ -1018,106 +1080,24 @@ fn http_json(method: &str, path: &str, body: &str) -> Option<String> {
 /// HTTP callers now run on the broker thread; `lan_ip` still calls this synchronously from the
 /// game thread (CreateNewNetwork / SerializeNetworkDescriptor), so an unreachable broker host can
 /// still cost the caller up to 1 s there.
-fn connect_stub(host: &str, port: u16) -> Option<TcpStream> {
-    use std::net::ToSocketAddrs;
-    let addr = (host, port).to_socket_addrs().ok()?.next()?;
-    TcpStream::connect_timeout(&addr, Duration::from_millis(1000)).ok()
-}
-
 /// Same as `http_json`, but also returns the HTTP status so callers can tell a refusal from a
 /// success. `None` means no usable response at all (broker down, timeout, malformed reply);
 /// `.0 == 0` means the status line could not be parsed.
 fn http_json_status(method: &str, path: &str, body: &str) -> Option<(u16, String)> {
     let (host, port) = stub_host();
-    let mut stream = connect_stub(&host, port)?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
-    let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(req.as_bytes()).ok()?;
-    let mut buf = Vec::new();
-    let _ = stream.read_to_end(&mut buf);
-    let text = String::from_utf8_lossy(&buf);
-    let idx = text.find("\r\n\r\n")?;
-    let status = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse::<u16>().ok())
-        .unwrap_or(0);
-    Some((status, text[idx + 4..].to_string()))
+    match http::request(&host, port, method, path, body, None) {
+        Ok(r) => Some((r.status, r.body)),
+        Err(e) => {
+            debug_log(&format!("http {method} {path} failed: {e:?}"));
+            None
+        }
+    }
 }
 
 /// Char-boundary-safe truncation for log lines (byte slicing panics on multibyte input).
-fn truncate_log(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        s.chars().take(n).collect()
-    }
-}
-
-fn json_str(blob: &str, key: &str) -> Option<String> {
-    let quoted = format!("\"{key}\":\"");
-    if let Some(rest) = blob.split(&quoted).nth(1) {
-        let end = rest.find('"')?;
-        return Some(rest[..end].to_string());
-    }
-    json_num(blob, key)
-}
-
-fn json_num(blob: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\":");
-    let rest = blob.split(&pat).nth(1)?;
-    let rest = rest.trim_start();
-    let end = rest
-        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
-        .unwrap_or(rest.len());
-    if end == 0 {
-        return None;
-    }
-    Some(rest[..end].to_string())
-}
-
-fn json_arr_objects(blob: &str, key: &str) -> Vec<String> {
-    let pat = format!("\"{key}\":[");
-    let Some(rest) = blob.split(&pat).nth(1) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut start = None;
-    for (i, c) in rest.char_indices() {
-        match c {
-            '{' => {
-                if depth == 0 {
-                    start = Some(i);
-                }
-                depth += 1;
-            }
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(s) = start {
-                        out.push(rest[s..=i].to_string());
-                    }
-                    start = None;
-                    if out.len() >= 32 {
-                        break;
-                    }
-                }
-            }
-            ']' if depth == 0 => break,
-            _ => {}
-        }
-    }
-    out
-}
-
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Descriptor {
+pub struct Descriptor {
     identifier: [u8; IDENT_LEN],
     region: [u8; REGION_LEN],
     opaque: [u8; OPAQUE_LEN],
@@ -1252,7 +1232,6 @@ const PENDING_CAP: usize = 128;
 const TYPE12_HOLD_TIMEOUT_MS: u64 = 10_000;
 
 struct Handle {
-    title: CString,
     users: Vec<*mut LocalUser>,
     networks: Vec<*mut Network>,
     pending: VecDeque<*mut u8>,
@@ -1315,10 +1294,6 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
-}
-
-fn is_chara_snapshot(op: u32, len: usize) -> bool {
-    op == 2 && len >= 600
 }
 
 fn note_snapshot() {
@@ -1418,7 +1393,7 @@ fn uuid_ident() -> String {
         ((t >> 16) as u16),
         (t as u16) & 0xfff,
         (n as u16) & 0xfff,
-        n.wrapping_mul(0x9e37) as u64 & 0xffff_ffff_ffff
+        n.wrapping_mul(0x9e37) & 0xffff_ffff_ffff
     )
 }
 
@@ -1596,7 +1571,7 @@ fn lan_ip() -> [u8; 4] {
     }
     // Prefer the NIC used to reach the stub when it is not loopback (other PCs).
     let (host, port) = stub_host();
-    if let Some(s) = connect_stub(&host, port) {
+    if let Some(s) = http::connect(&host, port) {
         if let Ok(SocketAddr::V4(v)) = s.local_addr() {
             if !v.ip().is_loopback() {
                 return v.ip().octets();
@@ -1614,34 +1589,6 @@ fn lan_ip() -> [u8; 4] {
         }
     }
     [127, 0, 0, 1]
-}
-
-fn ip_string(ip: [u8; 4]) -> String {
-    format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
-}
-
-fn is_loopback_ip(s: &str) -> bool {
-    let s = s.trim();
-    s == "127.0.0.1" || s == "::1" || s == "0.0.0.0" || s.starts_with("127.")
-}
-
-fn parse_lan1(raw: &str) -> (String, Option<[u8; 4]>) {
-    let rest = raw.strip_prefix("LAN1.").unwrap_or(raw);
-    let mut parts = rest.split('.');
-    let id = parts.next().unwrap_or(rest).to_string();
-    let ip = parts.next().and_then(|h| {
-        if h.len() != 8 {
-            return None;
-        }
-        let n = u32::from_str_radix(h, 16).ok()?;
-        Some([
-            (n >> 24) as u8,
-            (n >> 16) as u8,
-            (n >> 8) as u8,
-            n as u8,
-        ])
-    });
-    (id, ip)
 }
 
 fn desc_set_advert_ip(d: &mut Descriptor, ip: [u8; 4]) {
@@ -1716,13 +1663,7 @@ fn local_entity(n: &Network) -> String {
 /// type 3 from SC+0x180). If we emit EndpointCreated before that copy, the exe
 /// returns without inserting the peer and the shim never retries (eid already
 /// in `remotes`). Host then never sees the guest → 14C after timeout.
-fn ensure_remote(
-    h: &mut Handle,
-    net: *mut Network,
-    eid: &str,
-    ip: String,
-    udp_port: u16,
-) -> bool {
+fn ensure_remote(h: &mut Handle, net: *mut Network, eid: &str, ip: String, udp_port: u16) -> bool {
     if net.is_null() || eid.is_empty() {
         return false;
     }
@@ -1916,7 +1857,10 @@ unsafe fn deliver_type21(
     ptr::write_unaligned(sc.add(0x18) as *mut u32, 1);
     let recv_slot = sc.add(0x38) as *mut *mut Endpoint;
     ptr::write(recv_slot, (*net).local_endpoint);
-    ptr::write_unaligned(sc.add(0x20) as *mut *mut Endpoint, recv_slot as *mut Endpoint);
+    ptr::write_unaligned(
+        sc.add(0x20) as *mut *mut Endpoint,
+        recv_slot as *mut Endpoint,
+    );
     ptr::write_unaligned(sc.add(0x28) as *mut u32, recv_opts);
     ptr::write_unaligned(sc.add(0x2C) as *mut u32, payload.len() as u32);
     let dest = sc.add(0x40);
@@ -1926,7 +1870,10 @@ unsafe fn deliver_type21(
     let op = u32le(payload, 0).unwrap_or(0);
     if is_chara_snapshot(op, payload.len()) {
         note_snapshot();
-        debug_log(&format!("snapshot_delivered opcode={op} len={}", payload.len()));
+        debug_log(&format!(
+            "snapshot_delivered opcode={op} len={}",
+            payload.len()
+        ));
     }
 }
 
@@ -2028,9 +1975,7 @@ unsafe fn deliver_reliable(
             rel_bump(mode, |c| c.ooo_dropped += 1);
             log_throttled(
                 "recv_ooo_drop",
-                &format!(
-                    "dropped out-of-order best-effort seq={seq} high={high} (never buffered)"
-                ),
+                &format!("dropped out-of-order best-effort seq={seq} high={high} (never buffered)"),
             );
             false
         }
@@ -2096,28 +2041,21 @@ fn recv_udp(h: &mut Handle) {
                 Ok((len, src)) => {
                     budget -= 1;
                     XPORT_RX.fetch_add(1, Ordering::Relaxed);
-                    if len < HDR_LEN || &buf[..4] != MAGIC || buf[5] != HDR_VERSION {
-                        // No legacy fallback: a datagram without our magic/version is a protocol
-                        // mismatch. Log it once per peer and drop it rather than degrade silently.
-                        log_wire_mismatch(&src, len, &buf[..len.min(16)]);
-                        continue;
-                    }
-                    let kind = buf[4];
-                    let payload_len = u32::from_le_bytes(buf[44..48].try_into().unwrap()) as usize;
-                    if payload_len > 64 * 1024 || HDR_LEN + payload_len > len {
-                        log_wire_mismatch(&src, len, &buf[..len.min(16)]);
-                        continue;
-                    }
-                    let send_opts = u32::from_le_bytes(buf[48..52].try_into().unwrap());
-                    let seq = u32::from_le_bytes(buf[52..56].try_into().unwrap());
-                    let ack = if reliable::PARTY_RELIABLE {
-                        u32::from_le_bytes(buf[HDR_ACK_OFF..HDR_ACK_OFF + 4].try_into().unwrap())
-                    } else {
-                        0
+                    let parsed = match wire::parse(&buf[..len], reliable::PARTY_RELIABLE) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            // No legacy fallback: a datagram without our magic/version is a
+                            // protocol mismatch. Log it once per peer and drop it.
+                            log_wire_mismatch(&src, len, &buf[..len.min(16)]);
+                            continue;
+                        }
                     };
-                    let ent_raw = &buf[24..45];
-                    let ent_n = ent_raw.iter().position(|&b| b == 0).unwrap_or(20);
-                    let ent = String::from_utf8_lossy(&ent_raw[..ent_n]).into_owned();
+                    let kind = parsed.kind;
+                    let payload_len = parsed.payload_len;
+                    let send_opts = parsed.options;
+                    let seq = parsed.seq;
+                    let ack = parsed.ack;
+                    let ent = wire::entity(&buf[..len]);
                     let (src_ip, src_port) = match src {
                         SocketAddr::V4(v) => (v.ip().to_string(), v.port()),
                         SocketAddr::V6(_) => (String::new(), 0),
@@ -2144,7 +2082,10 @@ fn recv_udp(h: &mut Handle) {
                     }
                     if kind == KIND_HELLO {
                         if should_log_payload(&format!("hello:{ent}")) {
-                            debug_log(&format!("recv hello from={ent} remotes={}", n.remotes.len()));
+                            debug_log(&format!(
+                                "recv hello from={ent} remotes={}",
+                                n.remotes.len()
+                            ));
                         }
                         unsafe { request_peer_poll(net) };
                         continue;
@@ -2153,7 +2094,9 @@ fn recv_udp(h: &mut Handle) {
                         continue;
                     }
                     if kind != KIND_MSG {
-                        log_line(&format!("recv unknown kind={kind} from={ent} wire_len={len}"));
+                        log_line(&format!(
+                            "recv unknown kind={kind} from={ent} wire_len={len}"
+                        ));
                         continue;
                     }
                     let payload = buf[HDR_LEN..HDR_LEN + payload_len].to_vec();
@@ -2170,7 +2113,12 @@ fn recv_udp(h: &mut Handle) {
                         &format!("type=21 from={ent} remotes={}", n.remotes.len()),
                         &payload,
                     );
-                    if n.remotes.get(&ent).copied().unwrap_or(ptr::null_mut()).is_null() {
+                    if n.remotes
+                        .get(&ent)
+                        .copied()
+                        .unwrap_or(ptr::null_mut())
+                        .is_null()
+                    {
                         unsafe { request_peer_poll(net) };
                     }
                     let ep = n.remotes.get(&ent).copied().unwrap_or(ptr::null_mut());
@@ -2237,6 +2185,8 @@ fn recv_udp(h: &mut Handle) {
 
 /// Build one wire datagram. Field offsets are stable between v2 and v3; the cumulative ack is
 /// only written by the reliable build.
+/// Build one wire datagram (layout and tests live in `wire.rs`). The cumulative ack is only
+/// written by the reliable build.
 fn wire_packet(
     net_id: &str,
     local_ent: &[u8],
@@ -2246,29 +2196,25 @@ fn wire_packet(
     ack: u32,
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut pkt = vec![0u8; HDR_LEN + payload.len()];
-    pkt[..4].copy_from_slice(MAGIC);
-    pkt[4] = kind;
-    pkt[5] = HDR_VERSION;
-    let ib = net_id.as_bytes();
-    pkt[8..8 + ib.len().min(16)].copy_from_slice(&ib[..ib.len().min(16)]);
-    let n = local_ent.len().min(20);
-    pkt[24..24 + n].copy_from_slice(&local_ent[..n]);
-    pkt[44..48].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    pkt[48..52].copy_from_slice(&options.to_le_bytes());
-    pkt[52..56].copy_from_slice(&seq.to_le_bytes());
-    if reliable::PARTY_RELIABLE {
-        pkt[HDR_ACK_OFF..HDR_ACK_OFF + 4].copy_from_slice(&ack.to_le_bytes());
-    }
-    pkt[HDR_LEN..].copy_from_slice(payload);
-    pkt
+    wire::packet(
+        net_id,
+        local_ent,
+        kind,
+        options,
+        seq,
+        ack,
+        payload,
+        reliable::PARTY_RELIABLE,
+    )
 }
 
 fn ep_addr(e: &Endpoint) -> Option<SocketAddr> {
     if e.udp_port == 0 {
         return None;
     }
-    format!("{}:{}", e.ip, e.udp_port).parse::<SocketAddr>().ok()
+    format!("{}:{}", e.ip, e.udp_port)
+        .parse::<SocketAddr>()
+        .ok()
 }
 
 fn send_udp_all(net: &mut Network, kind: u8, payload: &[u8], options: u32) {
@@ -2491,7 +2437,6 @@ fn ensure_transport_thread() {
                 "transport thread spawn FAILED: {e}; using tick-driven inline transport"
             )),
         }
-        ()
     });
 }
 
@@ -2855,7 +2800,9 @@ fn ensure_broker_thread() {
     if force_inline_threads() {
         static LOGGED: AtomicBool = AtomicBool::new(false);
         if !LOGGED.swap(true, Ordering::Relaxed) {
-            debug_log("broker disabled (GBFR_PARTY_FORCE_INLINE); broker I/O runs inline (blocking)");
+            debug_log(
+                "broker disabled (GBFR_PARTY_FORCE_INLINE); broker I/O runs inline (blocking)",
+            );
         }
         return;
     }
@@ -2869,7 +2816,6 @@ fn ensure_broker_thread() {
                 "broker thread spawn FAILED: {e}; broker I/O will run inline (blocking)"
             )),
         }
-        ()
     });
 }
 
@@ -2928,8 +2874,9 @@ fn dispatch_broker(task: BrokerTask) {
                 }
                 if !found {
                     if q.len() >= BROKER_QUEUE_CAP {
-                        if let Some(pos) =
-                            q.iter().position(|t| matches!(t, BrokerTask::Register { .. }))
+                        if let Some(pos) = q
+                            .iter()
+                            .position(|t| matches!(t, BrokerTask::Register { .. }))
                         {
                             q.remove(pos);
                         }
@@ -3011,10 +2958,7 @@ fn broker_run(task: BrokerTask) {
                 )),
             }
         }
-        BrokerTask::Leave {
-            network_id,
-            entity,
-        } => {
+        BrokerTask::Leave { network_id, entity } => {
             let body = format!("{{\"network_id\":\"{network_id}\",\"entity_id\":\"{entity}\"}}");
             let _ = http_json("POST", "/party/leave", &body);
         }
@@ -3023,11 +2967,7 @@ fn broker_run(task: BrokerTask) {
             epoch,
             seq,
         } => {
-            let text = http_json(
-                "GET",
-                &format!("/party/peers?network_id={network_id}"),
-                "",
-            );
+            let text = http_json("GET", &format!("/party/peers?network_id={network_id}"), "");
             let mut members = Vec::new();
             if let Some(text) = text {
                 for obj in json_arr_objects(&text, "members") {
@@ -3155,7 +3095,10 @@ pub unsafe extern "C" fn PartyInitialize(title_id: *const c_char, handle: *mut *
     } else {
         CString::new(read_cstr(title_id)).unwrap_or_else(|_| CString::new("lan").unwrap())
     };
-    debug_log(&format!("PartyInitialize title={}", title.to_string_lossy()));
+    debug_log(&format!(
+        "PartyInitialize title={}",
+        title.to_string_lossy()
+    ));
     IS_HOST.store(false, Ordering::SeqCst);
     GUEST_SUB5_SENT.store(false, Ordering::SeqCst);
     HOST_SNAPSHOT.store(false, Ordering::SeqCst);
@@ -3177,7 +3120,6 @@ pub unsafe extern "C" fn PartyInitialize(title_id: *const c_char, handle: *mut *
     LEDGER_HB_MS.store(0, Ordering::Relaxed);
     LEDGER_HB_SKIPPED.store(0, Ordering::Relaxed);
     let mut boxed = Box::new(Handle {
-        title,
         users: Vec::new(),
         networks: Vec::new(),
         pending: VecDeque::new(),
@@ -3186,24 +3128,34 @@ pub unsafe extern "C" fn PartyInitialize(title_id: *const c_char, handle: *mut *
         batch_outstanding: false,
         last_peer_poll: Instant::now() - Duration::from_secs(10),
     });
+    debug_log(&format!(
+        "PartyInitialize title={} build={}",
+        title.to_string_lossy(),
+        env!("BUILD_STAMP")
+    ));
     *handle = boxed.as_mut() as *mut Handle as *mut c_void;
-    *g().lock().unwrap() = Some(boxed);
+    *g_lock() = Some(boxed);
     SUCCESS
 }
 
-fn with_handle<R>(handle: *mut c_void, f: impl FnOnce(&mut Handle) -> R, default: R) -> R {
-    // Recover poison the same way the worker threads do: a panic in a shim call must not turn
-    // every later export into a panic across the FFI boundary.
-    let mut g = match g().lock() {
-        Ok(g) => g,
-        Err(e) => {
+/// The global handle lock, recovering from a poisoned mutex. A panic while the handle was held (in
+/// an export or on a worker thread) must not turn every later export into a panic across the FFI
+/// boundary, which the game would see as a crash.
+fn g_lock() -> std::sync::MutexGuard<'static, Option<Box<Handle>>> {
+    match g().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
             static LOGGED: AtomicBool = AtomicBool::new(false);
             if !LOGGED.swap(true, Ordering::Relaxed) {
                 log_line("handle mutex poisoned; continuing with recovered state");
             }
-            e.into_inner()
+            poisoned.into_inner()
         }
-    };
+    }
+}
+
+fn with_handle<R>(handle: *mut c_void, f: impl FnOnce(&mut Handle) -> R, default: R) -> R {
+    let mut g = g_lock();
     match g.as_mut() {
         Some(h) => {
             let _ = handle;
@@ -3327,7 +3279,10 @@ pub unsafe extern "C" fn PartyCreateNewNetwork(
     let ent = if (*netp).local_user.is_null() {
         String::new()
     } else {
-        (*((*netp).local_user)).entity.to_string_lossy().into_owned()
+        (*((*netp).local_user))
+            .entity
+            .to_string_lossy()
+            .into_owned()
     };
     if !ent.is_empty() {
         register_member(unsafe { &*netp }, &ent);
@@ -3530,7 +3485,10 @@ pub unsafe extern "C" fn PartyNetworkAuthenticateLocalUser(
     let ent = if local_user.is_null() {
         String::new()
     } else {
-        (*(local_user as *mut LocalUser)).entity.to_string_lossy().into_owned()
+        (*(local_user as *mut LocalUser))
+            .entity
+            .to_string_lossy()
+            .into_owned()
     };
     if !ent.is_empty() {
         debug_log(&format!("WATCH_4 AuthenticateLocalUser entity={ent}"));
@@ -3572,7 +3530,7 @@ pub unsafe extern "C" fn PartyNetworkCreateEndpoint(
     let ent = if local_user.is_null() {
         CString::new("ep").unwrap()
     } else {
-        (* (local_user as *mut LocalUser)).entity.clone()
+        (*(local_user as *mut LocalUser)).entity.clone()
     };
     debug_log(&format!(
         "CreateEndpoint uid={uid} entity={}",
@@ -3668,12 +3626,15 @@ pub unsafe extern "C" fn PartyEndpointSendMessage(
         return ERR;
     }
     if target_count > 8 {
-        log_line(&format!("PartyEndpointSendMessage refuse target_count={target_count}"));
+        log_line(&format!(
+            "PartyEndpointSendMessage refuse target_count={target_count}"
+        ));
         return ERR;
     }
     // PartyDataBuffer { void* buffer; u32 size; } possibly 16-byte aligned
     let data_ptr = ptr::read_unaligned(buffers as *const *const u8);
-    let data_len = ptr::read_unaligned(buffers.add(std::mem::size_of::<*const u8>()) as *const u32) as usize;
+    let data_len =
+        ptr::read_unaligned(buffers.add(std::mem::size_of::<*const u8>()) as *const u32) as usize;
     if data_ptr.is_null() || data_len == 0 || data_len > 64 * 1024 {
         log_line(&format!("PartyEndpointSendMessage refuse len={data_len}"));
         return ERR;
@@ -3836,7 +3797,8 @@ unsafe fn member_list_has_entity(eid: &str) -> bool {
     };
     let begin = ptr::read_unaligned((members + 0x50) as *const usize);
     let end = ptr::read_unaligned((members + 0x58) as *const usize);
-    if begin == 0 || end < begin || (end - begin) % 0x20 != 0 || (end - begin) > 0x20 * 16 {
+    if begin == 0 || end < begin || !(end - begin).is_multiple_of(0x20) || (end - begin) > 0x20 * 16
+    {
         return false;
     }
     if !readable(begin, end - begin) {
@@ -3878,7 +3840,8 @@ unsafe fn collect_member_slots() -> Vec<MemberSlot> {
     };
     let begin = ptr::read_unaligned((members + 0x50) as *const usize);
     let end = ptr::read_unaligned((members + 0x58) as *const usize);
-    if begin == 0 || end < begin || (end - begin) % 0x20 != 0 || (end - begin) > 0x20 * 16 {
+    if begin == 0 || end < begin || !(end - begin).is_multiple_of(0x20) || (end - begin) > 0x20 * 16
+    {
         return out;
     }
     if !readable(begin, end - begin) {
@@ -3958,7 +3921,10 @@ fn ready_list_note() -> String {
         if begin == 0 {
             return format!(" ready={obj:#x} fl={flag} n=0");
         }
-        if end < begin || (end - begin) % READY_STRIDE != 0 || (end - begin) > READY_STRIDE * 16 {
+        if end < begin
+            || !(end - begin).is_multiple_of(READY_STRIDE)
+            || (end - begin) > READY_STRIDE * 16
+        {
             return format!(" ready={obj:#x} fl={flag} range_bad {begin:#x}..{end:#x}");
         }
         if !readable(begin, end - begin) {
@@ -4461,7 +4427,7 @@ fn async_verdict(st: &AsyncState) -> &'static str {
         "completed"
     } else if let Some((1, _)) = st.va_task {
         "loading"
-    } else if st.va_task.is_none() && st.q.map_or(false, |q| q.0 > 0) {
+    } else if st.va_task.is_none() && st.q.is_some_and(|q| q.0 > 0) {
         "queued"
     } else if st.va_task.is_none() && matches!(st.m1, Some((true, _, _))) {
         "registered"
@@ -4743,7 +4709,6 @@ fn ensure_sampler_thread() {
                 "solo sampler thread spawn FAILED: {e}; solo fields will not be sampled"
             ));
         }
-        ()
     });
 }
 
@@ -4851,13 +4816,22 @@ unsafe fn solo_sample_note() {
         mix(&mut key, (*q).map(u64::from));
     }
     mix(&mut key, async_st.mgr.map(|v| v as u64));
-    mix(&mut key, async_st.m1.map(|(present, len, tr)| {
-        (present as u64) | ((len as u64) << 1) | ((tr as u64) << 33)
-    }));
-    mix(&mut key, async_st.q.map(|(hits, total, _, _)| {
-        (hits as u64) | ((total as u64) << 32)
-    }));
-    mix(&mut key, async_st.q.and_then(|(_, _, mode, _)| mode).map(u64::from));
+    mix(
+        &mut key,
+        async_st
+            .m1
+            .map(|(present, len, tr)| (present as u64) | ((len as u64) << 1) | ((tr as u64) << 33)),
+    );
+    mix(
+        &mut key,
+        async_st
+            .q
+            .map(|(hits, total, _, _)| (hits as u64) | ((total as u64) << 32)),
+    );
+    mix(
+        &mut key,
+        async_st.q.and_then(|(_, _, mode, _)| mode).map(u64::from),
+    );
     mix(&mut key, async_st.q.map(|(_, _, _, tr)| tr as u64));
 
     let now = now_ms();
@@ -4936,8 +4910,9 @@ unsafe fn probe_session() {
         "guest"
     };
     let mut note = String::from("unreadable");
-    let mut state: i32 = -1;
-    let mut count: u32 = 0;
+    // Every path below assigns before reading; the old `-1`/`0` initialisers were dead.
+    let state: i32;
+    let count: u32;
     let mut n70: u32 = 0;
     let mut session_ptr = 0usize;
 
@@ -5063,7 +5038,10 @@ unsafe fn probe_session() {
         }
     };
     if changed || due {
-        debug_log(&format!("probe_session {role}: {note} {}", thread_probe_note()));
+        debug_log(&format!(
+            "probe_session {role}: {note} {}",
+            thread_probe_note()
+        ));
     }
 }
 
@@ -5132,7 +5110,6 @@ unsafe fn work_rows_note() -> String {
     format!("rows=[{}]", parts.join("; "))
 }
 
-
 /// Read-only summary of the exe's 0x180-stride queue/ready rows (DAT_1471AFB30) — the
 /// per-member connect/wait rows ProcessParty's case-4 pairs the work serial against.
 unsafe fn queue_rows_note() -> String {
@@ -5147,14 +5124,15 @@ unsafe fn queue_rows_note() -> String {
     let flag = ptr::read_unaligned((obj + 0x50) as *const u8);
     let begin = ptr::read_unaligned((obj + 0x58) as *const usize);
     let end = ptr::read_unaligned((obj + 0x60) as *const usize);
-    if begin == 0 || end < begin || (end - begin) % READY_STRIDE != 0 || (end - begin) > READY_STRIDE * 16 {
-        return format!(
-            "queue={obj:#x} badrange fl={flag} begin={begin:#x} end={end:#x}"
-        )
-        .into();
+    if begin == 0
+        || end < begin
+        || !(end - begin).is_multiple_of(READY_STRIDE)
+        || (end - begin) > READY_STRIDE * 16
+    {
+        return format!("queue={obj:#x} badrange fl={flag} begin={begin:#x} end={end:#x}");
     }
     if !readable(begin, end - begin) {
-        return format!("queue={obj:#x} unreadable").into();
+        return format!("queue={obj:#x} unreadable");
     }
     let mut ids = Vec::new();
     let mut e = begin;
@@ -5200,7 +5178,7 @@ unsafe fn mesh_trigger_timeline() {
         export_trace()
     );
     let key = fnv1a(&note);
-    if MESH_TRIGGER_KEY.swap(key, Ordering::Relaxed) != key || left % 8 == 0 {
+    if MESH_TRIGGER_KEY.swap(key, Ordering::Relaxed) != key || left.is_multiple_of(8) {
         debug_log(&note);
     }
 }
@@ -5253,7 +5231,9 @@ pub unsafe extern "C" fn PartyStartProcessingStateChanges(
                 let nets = h.networks.clone();
                 for n in nets {
                     if !n.is_null() {
-                        unsafe { (*n).poll_requested = false; }
+                        unsafe {
+                            (*n).poll_requested = false;
+                        }
                     }
                     poll_peers_request(n);
                 }
@@ -5280,7 +5260,7 @@ pub unsafe extern "C" fn PartyStartProcessingStateChanges(
             // member-list walk must stay on the tick thread.
             if h.networks
                 .iter()
-                .any(|n| !n.is_null() && unsafe { (**n).pending_peers.len() > 0 })
+                .any(|n| !n.is_null() && unsafe { !(**n).pending_peers.is_empty() })
             {
                 let nets = h.networks.clone();
                 for n in nets {
@@ -5326,106 +5306,105 @@ pub unsafe extern "C" fn PartyStartProcessingStateChanges(
             // before Finish, `in_flight` still belongs to it: leave it untouched and re-return it
             // below, and leave the queued changes in `pending` for the next real batch.
             if !h.batch_outstanding {
-            if !h.in_flight.is_empty() {
-                // The title called Start again without Finish for the previous batch. The clear
-                // below is the 8.1 reclaim; count it instead of dropping it silently.
-                let stale = h.in_flight.len();
-                log_throttled_lazy("inflight_stale", |_| {
-                    format!("Start reclaimed {stale} change(s) without Finish; title skipped FinishProcessingStateChanges")
-                });
-            }
-            h.in_flight.clear();
-            // Type-21 messages are deferred while a type-12 is still owed, because the exe looks
-            // the Party peer up during that handler. But the type-12 may sit BEHIND the message in
-            // the queue, so defer the message but keep draining, then put the deferred messages
-            // back at the front afterwards.
-            // P5: the hold is timestamped here (once per drain; the drain itself cannot change it)
-            // and `queue_sc` bounds the queue, so a type-12 that never arrives cannot starve the
-            // game forever or grow `h.pending` without bound.
-            let (type12_holding, type12_timed_out, type12_held_ms) = note_type12_hold(h);
-            let mut deferred21: Vec<*mut u8> = Vec::new();
-            let mut deferred_for_hold = false;
-            while let Some(p) = h.pending.pop_front() {
-                if h.in_flight.len() >= 32 {
-                    // This cap used to stop delivery silently; make it visible when it bites and
-                    // say how many were left queued (backlog 8.2 + D1).
-                    h.ledger.cap_hits += 1;
-                    let left = h.pending.len() + 1;
-                    log_throttled_lazy("in_flight_cap", |_| {
-                        format!(
+                if !h.in_flight.is_empty() {
+                    // The title called Start again without Finish for the previous batch. The clear
+                    // below is the 8.1 reclaim; count it instead of dropping it silently.
+                    let stale = h.in_flight.len();
+                    log_throttled_lazy("inflight_stale", |_| {
+                        format!("Start reclaimed {stale} change(s) without Finish; title skipped FinishProcessingStateChanges")
+                    });
+                }
+                h.in_flight.clear();
+                // Type-21 messages are deferred while a type-12 is still owed, because the exe looks
+                // the Party peer up during that handler. But the type-12 may sit BEHIND the message in
+                // the queue, so defer the message but keep draining, then put the deferred messages
+                // back at the front afterwards.
+                // P5: the hold is timestamped here (once per drain; the drain itself cannot change it)
+                // and `queue_sc` bounds the queue, so a type-12 that never arrives cannot starve the
+                // game forever or grow `h.pending` without bound.
+                let (type12_holding, type12_timed_out, type12_held_ms) = note_type12_hold(h);
+                let mut deferred21: Vec<*mut u8> = Vec::new();
+                let mut deferred_for_hold = false;
+                while let Some(p) = h.pending.pop_front() {
+                    if h.in_flight.len() >= 32 {
+                        // This cap used to stop delivery silently; make it visible when it bites and
+                        // say how many were left queued (backlog 8.2 + D1).
+                        h.ledger.cap_hits += 1;
+                        let left = h.pending.len() + 1;
+                        log_throttled_lazy("in_flight_cap", |_| {
+                            format!(
                             "StartProcessing hit the 32-change batch cap: handed_out=32 still_pending={left} (drain truncated)"
                         )
-                    });
-                    h.pending.push_front(p);
-                    break;
-                }
-                let ty = if p.is_null() {
-                    0
-                } else {
-                    unsafe { ptr::read_unaligned(p as *const u32) }
-                };
-                // Type 12 must run alone: the exe inserts the Party peer
-                // during that handler, and type 21 looks it up immediately.
-                if ty == 21 {
-                    let has12 = h.in_flight.iter().any(|q| {
-                        !q.is_null()
-                            && unsafe { ptr::read_unaligned(*q as *const u32) } == 12
-                    });
-                    // P5: defer only while the type-12 hold is inside its timeout. Once
-                    // `note_type12_hold` reports the timeout, the type-21s are delivered rather
-                    // than deferred, so a missing type-12 cannot silence the whole pump.
-                    if has12 || (type12_holding && !type12_timed_out) {
-                        if !has12 {
-                            deferred_for_hold = true;
+                        });
+                        h.pending.push_front(p);
+                        break;
+                    }
+                    let ty = if p.is_null() {
+                        0
+                    } else {
+                        unsafe { ptr::read_unaligned(p as *const u32) }
+                    };
+                    // Type 12 must run alone: the exe inserts the Party peer
+                    // during that handler, and type 21 looks it up immediately.
+                    if ty == 21 {
+                        let has12 = h.in_flight.iter().any(|q| {
+                            !q.is_null() && unsafe { ptr::read_unaligned(*q as *const u32) } == 12
+                        });
+                        // P5: defer only while the type-12 hold is inside its timeout. Once
+                        // `note_type12_hold` reports the timeout, the type-21s are delivered rather
+                        // than deferred, so a missing type-12 cannot silence the whole pump.
+                        if has12 || (type12_holding && !type12_timed_out) {
+                            if !has12 {
+                                deferred_for_hold = true;
+                            }
+                            deferred21.push(p);
+                            continue;
                         }
-                        deferred21.push(p);
-                        continue;
+                    }
+                    if (ty as usize) < h.ledger.handed.len() {
+                        h.ledger.handed[ty as usize] += 1;
+                    }
+                    h.in_flight.push(p);
+                    if ty == 12 {
+                        // D1: the hand-out half of the type-12 lifecycle.
+                        ledger_line(h, "type12-out");
+                        break;
+                    }
+                    if ty == 21 && DIAG_ONE_MSG_PER_BATCH {
+                        // TEMPORARY DIAGNOSTIC (revert after one run): deliver at most one type-21 per
+                        // batch. The host crashed twice at exactly `types=[21x6]`, so this separates
+                        // "the exe cannot take a burst of messages in one pump" from "the game state
+                        // is wrong for a specific message". Anything not delivered stays in `pending`.
+                        break;
                     }
                 }
-                if (ty as usize) < h.ledger.handed.len() {
-                    h.ledger.handed[ty as usize] += 1;
+                let deferred_count = deferred21.len();
+                for p in deferred21.into_iter().rev() {
+                    h.pending.push_front(p);
                 }
-                h.in_flight.push(p);
-                if ty == 12 {
-                    // D1: the hand-out half of the type-12 lifecycle.
-                    ledger_line(h, "type12-out");
-                    break;
-                }
-                if ty == 21 && DIAG_ONE_MSG_PER_BATCH {
-                    // TEMPORARY DIAGNOSTIC (revert after one run): deliver at most one type-21 per
-                    // batch. The host crashed twice at exactly `types=[21x6]`, so this separates
-                    // "the exe cannot take a burst of messages in one pump" from "the game state
-                    // is wrong for a specific message". Anything not delivered stays in `pending`.
-                    break;
-                }
-            }
-            let deferred_count = deferred21.len();
-            for p in deferred21.into_iter().rev() {
-                h.pending.push_front(p);
-            }
-            if deferred_count > 0 {
-                // P5: rate-limited deferral line with the live queue depth. The text is only
-                // built when the line will be emitted (probe-cost rule).
-                let count = deferred_count as u64;
-                h.ledger.deferred21 += count;
-                let depth = h.pending.len();
-                let total = h.ledger.deferred21;
-                let reason = if deferred_for_hold {
-                    "type12-owed"
-                } else {
-                    "type12-in-this-batch"
-                };
-                debug_throttled_lazy("type21_defer", |_| {
-                    format!(
+                if deferred_count > 0 {
+                    // P5: rate-limited deferral line with the live queue depth. The text is only
+                    // built when the line will be emitted (probe-cost rule).
+                    let count = deferred_count as u64;
+                    h.ledger.deferred21 += count;
+                    let depth = h.pending.len();
+                    let total = h.ledger.deferred21;
+                    let reason = if deferred_for_hold {
+                        "type12-owed"
+                    } else {
+                        "type12-in-this-batch"
+                    };
+                    debug_throttled_lazy("type21_defer", |_| {
+                        format!(
                         "type-21 deferral pending={depth} deferred={count} deferred_total={total} reason={reason} held_ms={type12_held_ms} timed_out={type12_timed_out} (P5 timeout={TYPE12_HOLD_TIMEOUT_MS}ms cap={PENDING_CAP})"
                     )
-                });
-            }
-            if !h.in_flight.is_empty() {
-                h.ledger.batches += 1;
-            }
-            h.ledger.last_batch = h.in_flight.len() as u64;
-            h.batch_outstanding = !h.in_flight.is_empty();
+                    });
+                }
+                if !h.in_flight.is_empty() {
+                    h.ledger.batches += 1;
+                }
+                h.ledger.last_batch = h.in_flight.len() as u64;
+                h.batch_outstanding = !h.in_flight.is_empty();
             } else {
                 log_throttled(
                     "batch_outstanding",
@@ -5461,7 +5440,9 @@ pub unsafe extern "C" fn PartyStartProcessingStateChanges(
                         parts.push(format!("{ty}x{n}"));
                     }
                 }
-                let has_ctrl = types[2] + types[3] + types[4] + types[10] + types[12] + types[13] + types[19] > 0;
+                let has_ctrl =
+                    types[2] + types[3] + types[4] + types[10] + types[12] + types[13] + types[19]
+                        > 0;
                 if has_ctrl || should_log_payload("pump") {
                     debug_log(&format!(
                         "PartyStartProcessing n={} types=[{}]",
@@ -5593,12 +5574,12 @@ unsafe fn log_leave_stack() {
     let n = RtlCaptureStackBackTrace(1, 10, frames.as_mut_ptr(), ptr::null_mut());
     let exe = GetModuleHandleA(ptr::null()) as usize;
     let mut s = String::from("LeaveNetwork stack");
-    for i in 0..n as usize {
-        let p = frames[i] as usize;
+    for frame in frames.iter().take(n as usize) {
+        let p = *frame as usize;
         if exe != 0 && p >= exe && p < exe + 0x1000_0000 {
             s.push_str(&format!(" rva={:#x}", p - exe));
         } else {
-            s.push_str(&format!(" {:p}", frames[i]));
+            s.push_str(&format!(" {:p}", frame));
         }
     }
     debug_log(&s);

@@ -22,6 +22,9 @@
 use serde_json::{Map, Value};
 use std::cmp::Ordering;
 
+/// Variant names mirror the documented OData keys (`string_keyN` / `number_keyN`), so they
+/// end with the enum name on purpose.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Key {
     StringKey(u32),
@@ -261,7 +264,12 @@ pub fn parse_filter(s: &str) -> Filter {
         let raw = s[start..sc.i].trim().to_string();
         match parse_key(key_tok) {
             Some(key) => {
-                let clause = Clause { key, op, value, raw };
+                let clause = Clause {
+                    key,
+                    op,
+                    value,
+                    raw,
+                };
                 if clause_supported(&clause) {
                     out.clauses.push(clause);
                 } else {
@@ -294,7 +302,10 @@ pub fn parse_sort(s: &str) -> (Vec<SortSpec>, Vec<String>) {
         if term.is_empty() {
             continue;
         }
-        if let Some(inner) = term.strip_prefix("distance{").and_then(|t| t.strip_suffix('}')) {
+        if let Some(inner) = term
+            .strip_prefix("distance{")
+            .and_then(|t| t.strip_suffix('}'))
+        {
             match inner.split_once('=') {
                 Some((k, v)) => {
                     let key = parse_key(k.trim());
@@ -329,8 +340,17 @@ pub fn parse_sort(s: &str) -> (Vec<SortSpec>, Vec<String>) {
             }
         };
         match key {
-            Some(k @ (Key::NumberKey(_) | Key::MemberCount | Key::MaxMemberCount | Key::MemberCountRemaining)) => {
-                specs.push(SortSpec { key: k, desc, distance: None });
+            Some(
+                k @ (Key::NumberKey(_)
+                | Key::MemberCount
+                | Key::MaxMemberCount
+                | Key::MemberCountRemaining),
+            ) => {
+                specs.push(SortSpec {
+                    key: k,
+                    desc,
+                    distance: None,
+                });
             }
             // The docs restrict OrderBy to the numeric search keys; strings are unsupported.
             _ => bad.push(term.to_string()),
@@ -423,7 +443,9 @@ fn eval_clause(c: &Clause, l: &LobbyView) -> Result<bool, String> {
         }),
         Key::AmOwner => {
             let want = parse_bool(&c.value).ok_or_else(|| c.raw.clone())?;
-            let is_owner = l.viewer_id.is_some_and(|v| !v.is_empty() && v == l.owner_id);
+            let is_owner = l
+                .viewer_id
+                .is_some_and(|v| !v.is_empty() && v == l.owner_id);
             Ok(match c.op {
                 Op::Eq => is_owner == want,
                 Op::Ne => is_owner != want,
@@ -595,7 +617,10 @@ mod tests {
             let f = parse_filter(bad);
             assert!(!f.unsupported().is_empty(), "not reported: {bad}");
             let data = sd(json!({"number_key9": "1"}));
-            assert!(!f.matches(&view("a", &data, "Unlocked")), "did not fail closed: {bad}");
+            assert!(
+                !f.matches(&view("a", &data, "Unlocked")),
+                "did not fail closed: {bad}"
+            );
         }
     }
 

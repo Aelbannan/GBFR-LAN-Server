@@ -326,10 +326,16 @@ pub enum RecvOutcome {
     /// filled a gap and previously queued sequential messages were drained behind it.
     Delivered(Vec<RecvMsg>),
     /// Buffered waiting for earlier sequential guaranteed messages.
-    Queued { seq: u32, expected: u32 },
+    Queued {
+        seq: u32,
+        expected: u32,
+    },
     DroppedDuplicate,
     /// Best-effort sequential message older than the high-water sequence (never buffered).
-    DroppedOutOfOrder { seq: u32, high: u32 },
+    DroppedOutOfOrder {
+        seq: u32,
+        high: u32,
+    },
 }
 
 pub struct Receiver {

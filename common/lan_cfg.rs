@@ -75,9 +75,7 @@ fn load_lan_cfg() -> LanCfg {
                 }
                 ("party", "udp_port") => udp_port = v.parse().unwrap_or(udp_port),
                 // `[debug] enabled = true` or a bare `debug = true` in any section.
-                ("debug", "enabled") | (_, "debug") => {
-                    debug = parse_bool(v).unwrap_or(debug)
-                }
+                ("debug", "enabled") | (_, "debug") => debug = parse_bool(v).unwrap_or(debug),
                 _ => {}
             }
         }
@@ -160,7 +158,7 @@ pub fn rewrite_http_url_to_stub(url: &str) -> String {
     if !(lower.starts_with("http://") || lower.starts_with("https://")) {
         return url.to_string();
     }
-    let rest = url.splitn(2, "://").nth(1).unwrap_or("");
+    let rest = url.split_once("://").map(|x| x.1).unwrap_or("");
     let path = rest.find('/').map(|i| &rest[i..]).unwrap_or("/");
     format!("{}{path}", lan_cfg().origin())
 }

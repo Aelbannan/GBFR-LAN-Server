@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use serde_json::{json, Map, Value};
@@ -19,6 +19,8 @@ use sha1::{Digest, Sha1};
 #[path = "../../common/lan_cfg.rs"]
 mod lan_cfg;
 mod lobby_filter;
+#[cfg(test)]
+mod tests;
 
 const TITLE_DEFAULT: &str = "1AC1AD";
 const BLOB_KEY: &[u8; 32] = b"kdfg8kojildksuie23jsdfg8fg7klsdx";
@@ -353,13 +355,7 @@ fn is_loopback_ip(s: &str) -> bool {
 fn lobby_owner_id(lobby: &Lobby) -> String {
     json_str(&lobby.owner, "Id")
         .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            lobby
-                .owner
-                .as_str()
-                .unwrap_or("")
-                .to_string()
-        })
+        .unwrap_or_else(|| lobby.owner.as_str().unwrap_or("").to_string())
 }
 
 fn lobby_lan1_network_id(lobby: &Lobby) -> Option<String> {
@@ -403,9 +399,7 @@ fn drop_owner_lobbies(app: &mut App, owner_id: &str) {
         .collect();
     for id in stale {
         app.lobbies.remove(&id);
-        request_log(&format!(
-            "CreateLobby drop stale {id} owner={owner_id}"
-        ));
+        request_log(&format!("CreateLobby drop stale {id} owner={owner_id}"));
     }
 }
 
@@ -652,7 +646,10 @@ fn parse_owner_migration_policy(body: &Value) -> i64 {
 }
 
 fn create_lobby(app: &mut App, body: &Value, player: &Player) -> String {
-    let lobby_id = format!("lan-{}", &sha1_hex(&format!("{}{}", now_unix(), player.entity_id))[..12]);
+    let lobby_id = format!(
+        "lan-{}",
+        &sha1_hex(&format!("{}{}", now_unix(), player.entity_id))[..12]
+    );
     let owner = body
         .get("Owner")
         .or_else(|| body.get("owner"))
@@ -666,12 +663,12 @@ fn create_lobby(app: &mut App, body: &Value, player: &Player) -> String {
         .and_then(|v| v.as_array())
     {
         if let Some(first) = arr.first() {
-            member_data = as_obj_or_empty(
-                first
-                    .get("MemberData")
-                    .or_else(|| first.get("memberData")),
-            );
-            if let Some(ent) = first.get("MemberEntity").or_else(|| first.get("memberEntity")) {
+            member_data =
+                as_obj_or_empty(first.get("MemberData").or_else(|| first.get("memberData")));
+            if let Some(ent) = first
+                .get("MemberEntity")
+                .or_else(|| first.get("memberEntity"))
+            {
                 member_entity = ent.clone();
             }
         }
@@ -691,7 +688,10 @@ fn create_lobby(app: &mut App, body: &Value, player: &Player) -> String {
         connection: format!("lan.{}.{}", app.title_id, lobby_id),
         owner,
         owner_migration_policy: parse_owner_migration_policy(body),
-        max_players: resolve_lobby_max(app, json_i64(body, "MaxPlayers").or_else(|| json_i64(body, "maxPlayers"))),
+        max_players: resolve_lobby_max(
+            app,
+            json_i64(body, "MaxPlayers").or_else(|| json_i64(body, "maxPlayers")),
+        ),
         lobby_data: as_obj_or_empty(
             body.get("LobbyData")
                 .or_else(|| body.get("lobbyData"))
@@ -836,12 +836,7 @@ fn rate_limited_log(key: &str, msg: &str) {
 
 fn strip_api_prefix(path: &str) -> String {
     let p = path.split('?').next().unwrap_or(path);
-    for prefix in [
-        "/v1/api/index.php/",
-        "/v1/api/",
-        "/index.php/",
-        "/api/",
-    ] {
+    for prefix in ["/v1/api/index.php/", "/v1/api/", "/index.php/", "/api/"] {
         if let Some(rest) = p.strip_prefix(prefix) {
             return format!("/{}", rest.trim_start_matches('/'));
         }
@@ -916,7 +911,10 @@ fn handle_cygames(
     if p == "activity/get_invite_list" || p == "activity/get_presence_list" {
         return Some(cygames_ok(json!({})));
     }
-    if p == "cygames_id/link_status" || p == "cygames_id/link" || p == "cygames_id/unlink" || p.starts_with("cygames_id/") && p != "cygames_id/check_reward"
+    if p == "cygames_id/link_status"
+        || p == "cygames_id/link"
+        || p == "cygames_id/unlink"
+        || p.starts_with("cygames_id/") && p != "cygames_id/check_reward"
     {
         return Some(cygames_ok(json!({"is_pending": false, "link_status": 0})));
     }
@@ -951,12 +949,7 @@ fn handle_playfab(
 
     if lower.replace('_', "").contains("getentitytoken") {
         let player = request_entity_id(app, body, headers)
-            .and_then(|id| {
-                app.sessions
-                    .values()
-                    .find(|p| p.entity_id == id)
-                    .cloned()
-            })
+            .and_then(|id| app.sessions.values().find(|p| p.entity_id == id).cloned())
             .unwrap_or_else(|| {
                 let t = json_str(body, "SteamTicket").unwrap_or("anonymous");
                 player_from_ticket(app, t)
@@ -970,12 +963,7 @@ fn handle_playfab(
 
     if lower.contains("createandjoinlobby") || lower.ends_with("lobby/createlobby") {
         let player = request_entity_id(app, body, headers)
-            .and_then(|id| {
-                app.sessions
-                    .values()
-                    .find(|p| p.entity_id == id)
-                    .cloned()
-            })
+            .and_then(|id| app.sessions.values().find(|p| p.entity_id == id).cloned())
             .unwrap_or_else(|| player_from_ticket(app, "anonymous"));
         let id = create_lobby(app, body, &player);
         let lobby = app.lobbies.get(&id).unwrap();
@@ -993,12 +981,7 @@ fn handle_playfab(
 
     if lower.ends_with("lobby/joinlobby") || lower.ends_with("joinlobby") {
         let player = request_entity_id(app, body, headers)
-            .and_then(|id| {
-                app.sessions
-                    .values()
-                    .find(|p| p.entity_id == id)
-                    .cloned()
-            })
+            .and_then(|id| app.sessions.values().find(|p| p.entity_id == id).cloned())
             .unwrap_or_else(|| player_from_ticket(app, "anonymous"));
         let conn = json_str(body, "ConnectionString")
             .or_else(|| json_str(body, "connectionString"))
@@ -1212,7 +1195,9 @@ fn handle_playfab(
             ids.join(","),
             truncate_chars(&filter_text, 1024),
             truncate_chars(&sort_text, 128),
-            count.map(|c| c.to_string()).unwrap_or_else(|| "none".into()),
+            count
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "none".into()),
             warnings.join(" | "),
             sk5_notes.join(" | ")
         ));
@@ -1253,14 +1238,8 @@ fn handle_playfab(
                     lobby.owner = next
                         .get("MemberEntity")
                         .cloned()
-                        .filter(|v| {
-                            json_str(v, "Id")
-                                .map(|s| !s.is_empty())
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or_else(|| {
-                            json!({"Id": eid, "Type": "title_player_account"})
-                        });
+                        .filter(|v| json_str(v, "Id").map(|s| !s.is_empty()).unwrap_or(false))
+                        .unwrap_or_else(|| json!({"Id": eid, "Type": "title_player_account"}));
                 } else {
                     owner_note = format!(" owner->none(policy={policy})");
                     lobby.owner = Value::Null;
@@ -1301,7 +1280,8 @@ fn handle_playfab(
             {
                 lobby.membership_lock = lock.to_string();
             }
-            if let Some(mx) = json_i64(body, "MaxPlayers").or_else(|| json_i64(body, "maxPlayers")) {
+            if let Some(mx) = json_i64(body, "MaxPlayers").or_else(|| json_i64(body, "maxPlayers"))
+            {
                 lobby.max_players = clamp_max_players(mx).max(lobby.members.len() as i64);
             }
             if let Some(ap) =
@@ -1320,7 +1300,9 @@ fn handle_playfab(
                 if let Some(target) = member_set_target.as_ref() {
                     if let Some(m) = lobby.members.iter_mut().find(|m| member_id(m) == *target) {
                         if let Some(obj) = m.as_object_mut() {
-                            if let Some(md) = obj.get_mut("MemberData").and_then(|v| v.as_object_mut()) {
+                            if let Some(md) =
+                                obj.get_mut("MemberData").and_then(|v| v.as_object_mut())
+                            {
                                 for k in &member_del {
                                     md.remove(k);
                                 }
@@ -1479,7 +1461,10 @@ fn handle_party(
                 "party join refused network={nid} entity={eid} members={} max={cap}",
                 net.len()
             ));
-            return Some(playfab_err("PartyMemberLimitExceeded", "Party mesh is full"));
+            return Some(playfab_err(
+                "PartyMemberLimitExceeded",
+                "Party mesh is full",
+            ));
         }
         if new_member {
             net.insert(
@@ -1628,10 +1613,7 @@ fn dispatch(
         Some((_, q)) if !q.is_empty() => format!("/{party}?{q}"),
         _ => format!("/{party}"),
     };
-    let host = headers
-        .get("host")
-        .cloned()
-        .unwrap_or_default();
+    let host = headers.get("host").cloned().unwrap_or_default();
     log_request(method, &host, &stripped);
 
     // Poison-tolerant locking: a panic anywhere while the state lock is held would otherwise
@@ -1673,7 +1655,11 @@ fn dispatch(
         let raw = serde_json::to_vec(&cfg).unwrap_or_default();
         if stripped.ends_with(".blob") {
             let blob = encode_boot_blob(&raw);
-            request_log(&format!("boot .blob {} json -> {} b64", raw.len(), blob.len()));
+            request_log(&format!(
+                "boot .blob {} json -> {} b64",
+                raw.len(),
+                blob.len()
+            ));
             return (200, "application/octet-stream", blob);
         }
         return (200, "application/json", raw);
@@ -1682,15 +1668,19 @@ fn dispatch(
     if method == "POST" {
         // Every catch-all hit is logged with its method and normalised path: the LS-9 failure
         // mode was a prefixed /party/join answering success here while doing nothing.
-        log_line(&format!("catch-all POST {stripped} — no handler, empty PlayFab OK"));
+        log_line(&format!(
+            "catch-all POST {stripped} — no handler, empty PlayFab OK"
+        ));
         return playfab_ok(json!({}));
     }
-    log_line(&format!("catch-all {method} {stripped} — no handler, empty cygames OK"));
+    log_line(&format!(
+        "catch-all {method} {stripped} — no handler, empty cygames OK"
+    ));
     cygames_ok(json!({}))
 }
 
 fn send_http(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) {
-        let reason = match code {
+    let reason = match code {
         200 => "OK",
         101 => "Switching Protocols",
         204 => "No Content",
@@ -1772,12 +1762,17 @@ fn handle_ws_payload(stream: &mut TcpStream, data: &[u8]) {
     }
 }
 
-fn pump_websocket(stream: &mut TcpStream) {
+fn pump_websocket(stream: &mut TcpStream, idle: Duration) {
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(None);
+    // An upgraded socket can sit silent for the length of a quest, so the timeout is generous —
+    // but it is a timeout: the previous `None` held a thread (and a connection slot) forever.
+    let _ = stream.set_read_timeout(Some(idle));
     loop {
         let mut hdr = [0u8; 2];
-        if stream.read_exact(&mut hdr).is_err() {
+        if let Err(e) = stream.read_exact(&mut hdr) {
+            if e.kind() == ErrorKind::TimedOut || e.kind() == ErrorKind::WouldBlock {
+                request_log(&format!("websocket idle {idle:?} — closing"));
+            }
             break;
         }
         let opcode = hdr[0] & 0x0f;
@@ -1829,14 +1824,21 @@ fn pump_websocket(stream: &mut TcpStream) {
             request_log(&format!(
                 "ws frame opcode={opcode} len={} head={}",
                 data.len(),
-                data.iter().take(32).map(|b| format!("{b:02x}")).collect::<String>()
+                data.iter()
+                    .take(32)
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
             ));
         }
     }
     request_log("websocket closed");
 }
 
-fn handle_ws_upgrade(stream: &mut TcpStream, headers: &HashMap<String, String>) -> bool {
+fn handle_ws_upgrade(
+    stream: &mut TcpStream,
+    headers: &HashMap<String, String>,
+    idle: Duration,
+) -> bool {
     let Some(key) = headers.get("sec-websocket-key") else {
         send_http(stream, 400, "text/plain", b"missing Sec-WebSocket-Key");
         return true;
@@ -1856,17 +1858,81 @@ fn handle_ws_upgrade(stream: &mut TcpStream, headers: &HashMap<String, String>) 
         return true;
     }
     request_log("websocket connected");
-    pump_websocket(stream);
+    pump_websocket(stream, idle);
     true
 }
 
-fn read_request(
-    stream: &mut TcpStream,
-    header_timeout: Option<Duration>,
-    local_port: u16,
-) -> Option<(String, String, HashMap<String, String>, Vec<u8>)> {
-    let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(header_timeout);
+/// Hard ceiling on one request body: the game's largest request is a lobby/member map of a few
+/// KB, and the header cap is already 1 MB. A declared length beyond this is refused before a byte
+/// of the body is read, so a hostile `Content-Length` cannot park a thread in the read loop.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Request framing bytes. Written as numbers (never as Rust escape sequences) so no tooling layer
+/// can turn the escape into a real newline and silently change the terminator.
+const CR: u8 = 0x0D;
+const LF: u8 = 0x0A;
+const HEAD_END: [u8; 4] = [CR, LF, CR, LF];
+
+/// Result of one request read. `Dropped` covers everything that gets no response (EOF, timeout,
+/// TLS on the plaintext port, malformed head, header cap, empty read) — every one of those paths
+/// logs before returning. `TooLarge` is a well-formed request whose declared body exceeds
+/// `MAX_BODY_BYTES`, and the caller answers it with a 413.
+enum ReadResult {
+    Request(String, String, HashMap<String, String>, Vec<u8>),
+    TooLarge,
+    Dropped,
+}
+
+/// Hard ceiling on concurrently served sockets. The game keeps a handful open per client and
+/// Nucleus runs up to 8 clients, so this is far above any real session; it exists so a peer that
+/// opens sockets without sending a request cannot spawn threads without bound.
+const MAX_CONNECTIONS: usize = 256;
+static LIVE_CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Listener options. `ws_idle` is an option (rather than a constant) so tests can use a few
+/// milliseconds where a real session uses minutes.
+#[derive(Clone, Copy)]
+struct ServerOpts {
+    ws_idle: Duration,
+}
+
+impl Default for ServerOpts {
+    fn default() -> Self {
+        // Generous on purpose: the game exchanges no WebSocket traffic for the length of a quest,
+        // so a short timeout would cut live sessions. The point is that an idle socket cannot hold
+        // a thread for the process lifetime.
+        Self {
+            ws_idle: Duration::from_secs(900),
+        }
+    }
+}
+
+/// RAII slot in the connection budget, dropped on every exit path of a connection.
+struct ConnGuard;
+
+impl ConnGuard {
+    fn acquire() -> Option<Self> {
+        let n = LIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst) + 1;
+        if n > MAX_CONNECTIONS {
+            LIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+            None
+        } else {
+            Some(Self)
+        }
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        LIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Read one HTTP request. Generic over the reader so the framing (Content-Length, the header
+/// cap, TLS ClientHello detection, timeouts) is unit-testable without a socket; `handle_client`
+/// passes the TcpStream itself after applying the socket options. Callers that need a timeout
+/// must set it on the underlying stream, since `Read` has no timeout API.
+fn read_request<R: Read>(stream: &mut R, local_port: u16) -> ReadResult {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     loop {
@@ -1879,25 +1945,23 @@ fn read_request(
                         "ws TLS ClientHello local={local_port} have={} — Relink used WSS on plaintext 8081",
                         buf.len()
                     ));
-                    return None;
+                    return ReadResult::Dropped;
                 }
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                if buf.windows(4).any(|w| w == HEAD_END) {
                     break;
                 }
                 if buf.len() > 1024 * 1024 {
                     log_line(&format!("http read too large local={local_port}"));
-                    return None;
+                    return ReadResult::Dropped;
                 }
             }
-            Err(e)
-                if e.kind() == ErrorKind::TimedOut || e.kind() == ErrorKind::WouldBlock =>
-            {
+            Err(e) if e.kind() == ErrorKind::TimedOut || e.kind() == ErrorKind::WouldBlock => {
                 let head: String = buf.iter().take(32).map(|b| format!("{b:02x}")).collect();
                 log_line(&format!(
                     "http read timeout local={local_port} have={} head={head}",
                     buf.len()
                 ));
-                return None;
+                return ReadResult::Dropped;
             }
             Err(e) => {
                 let head: String = buf.iter().take(32).map(|b| format!("{b:02x}")).collect();
@@ -1906,60 +1970,69 @@ fn read_request(
                     "http read err local={local_port} {e} have={} head={head}{}",
                     buf.len(),
                     if tls {
-                        " (TLS ClientHello — WSS on plaintext WS port)"
+                        " (TLS ClientHello - WSS on plaintext WS port)"
                     } else {
                         ""
                     }
                 ));
-                return None;
+                return ReadResult::Dropped;
             }
         }
     }
     if buf.is_empty() {
         log_line(&format!("http read empty local={local_port}"));
-        return None;
+        return ReadResult::Dropped;
     }
-    let text = String::from_utf8_lossy(&buf);
-    let Some((head, rest)) = text.split_once("\r\n\r\n") else {
+    // Split on the byte pattern, not on a lossy String: the body may be binary.
+    let Some(idx) = buf.windows(4).position(|w| w == HEAD_END) else {
         let head: String = buf.iter().take(32).map(|b| format!("{b:02x}")).collect();
         log_line(&format!(
             "http read truncated local={local_port} have={} head={head}",
             buf.len()
         ));
-        return None;
+        return ReadResult::Dropped;
     };
-    let mut lines = head.split("\r\n");
-    let req = lines.next()?;
-    let mut parts = req.split_whitespace();
-    let method = parts.next()?.to_string();
-    let path = parts.next()?.to_string();
+    let mut lines = buf[..idx].split(|&b| b == LF);
+    let Some(req_line) = lines.next() else {
+        return ReadResult::Dropped;
+    };
+    let req_line = String::from_utf8_lossy(req_line).into_owned();
+    let mut parts = req_line.split_whitespace();
+    let (Some(method), Some(path)) = (parts.next(), parts.next()) else {
+        log_line(&format!("http malformed request line local={local_port}"));
+        return ReadResult::Dropped;
+    };
+    let (method, path) = (method.to_string(), path.to_string());
     let mut headers = HashMap::new();
     for line in lines {
+        let line = String::from_utf8_lossy(line);
+        let line = line.trim_end_matches(char::from(CR));
         if let Some((k, v)) = line.split_once(':') {
             headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
         }
     }
-    let mut body = rest.as_bytes().to_vec();
-    // If we over-read into the header buffer split, rest is already the start of body.
-    // Original buf may have extra after headers as binary-safe:
-    if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-        body = buf[idx + 4..].to_vec();
-    }
+    let mut body = buf[idx + 4..].to_vec();
     let want = headers
         .get("content-length")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
+    if want > MAX_BODY_BYTES {
+        log_line(&format!(
+            "http body too large local={local_port} want={want} cap={MAX_BODY_BYTES}"
+        ));
+        return ReadResult::TooLarge;
+    }
     while body.len() < want {
-        let n = stream.read(&mut tmp).ok()?;
-        if n == 0 {
-            break;
+        match stream.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => body.extend_from_slice(&tmp[..n]),
+            // A read error ends the request; a half-received body must not be dispatched.
+            Err(_) => return ReadResult::Dropped,
         }
-        body.extend_from_slice(&tmp[..n]);
     }
     body.truncate(want);
-    Some((method, path, headers, body))
+    ReadResult::Request(method, path, headers, body)
 }
-
 fn is_websocket_upgrade(headers: &HashMap<String, String>) -> bool {
     headers
         .get("upgrade")
@@ -1971,7 +2044,7 @@ fn is_websocket_upgrade(headers: &HashMap<String, String>) -> bool {
         .unwrap_or(false)
 }
 
-fn handle_client(mut stream: TcpStream, app: Arc<Mutex<App>>) {
+fn handle_client(mut stream: TcpStream, app: Arc<Mutex<App>>, opts: ServerOpts) {
     let local_port = stream.local_addr().map(|a| a.port()).unwrap_or(0);
     let app_ws = app.lock().ok().map(|g| g.ws_port).unwrap_or(0);
     // WinHTTP Connects to 8081 at user_auth, then SendRequest (upgrade GET) only
@@ -1981,10 +2054,16 @@ fn handle_client(mut stream: TcpStream, app: Arc<Mutex<App>>) {
     } else {
         Some(Duration::from_secs(15))
     };
-    let Some((method, path, mut headers, body_raw)) =
-        read_request(&mut stream, header_timeout, local_port)
-    else {
-        return;
+    let _ = stream.set_nodelay(true);
+    // The timeout is per read on the socket, not overall; `read_request` does not set it.
+    let _ = stream.set_read_timeout(header_timeout);
+    let (method, path, mut headers, body_raw) = match read_request(&mut stream, local_port) {
+        ReadResult::Request(method, path, headers, body) => (method, path, headers, body),
+        ReadResult::TooLarge => {
+            send_http(&mut stream, 413, "text/plain", b"request body too large");
+            return;
+        }
+        ReadResult::Dropped => return,
     };
     if let Ok(addr) = stream.peer_addr() {
         let ip = match addr {
@@ -1994,7 +2073,7 @@ fn handle_client(mut stream: TcpStream, app: Arc<Mutex<App>>) {
         headers.entry("x-peer-ip".into()).or_insert(ip);
     }
     if is_websocket_upgrade(&headers) {
-        let _ = handle_ws_upgrade(&mut stream, &headers);
+        let _ = handle_ws_upgrade(&mut stream, &headers, opts.ws_idle);
         return;
     }
     if local_port != 0 {
@@ -2014,29 +2093,52 @@ fn handle_client(mut stream: TcpStream, app: Arc<Mutex<App>>) {
     let json_body: Value = if body_raw.is_empty() {
         json!({})
     } else {
-        serde_json::from_slice(&body_raw).unwrap_or_else(|_| {
-            json!({"_raw": String::from_utf8_lossy(&body_raw)})
-        })
+        serde_json::from_slice(&body_raw)
+            .unwrap_or_else(|_| json!({"_raw": String::from_utf8_lossy(&body_raw)}))
     };
     let (code, ctype, out) = dispatch(&app, &method, &path, &headers, &json_body);
     send_http(&mut stream, code, ctype, &out);
 }
 
-fn listen(addr: &str, app: Arc<Mutex<App>>, name: &str) {
-    let listener = TcpListener::bind(addr).unwrap_or_else(|e| {
-        eprintln!("bind {addr} failed: {e}");
-        std::process::exit(1);
-    });
+fn bind_listener(addr: &str) -> std::io::Result<TcpListener> {
+    TcpListener::bind(addr)
+}
+
+/// Accept loop for one listener. Split from `listen` so tests can bind `127.0.0.1:0` (learning the
+/// real port from `local_addr`) and serve the same code paths in-process.
+fn serve(listener: TcpListener, app: Arc<Mutex<App>>, name: &str, opts: ServerOpts) {
+    let addr = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "?".into());
     request_log(&format!("{name} {addr}"));
     for s in listener.incoming() {
         match s {
-            Ok(stream) => {
+            Ok(mut stream) => {
+                let Some(guard) = ConnGuard::acquire() else {
+                    log_line(&format!(
+                        "connection refused at cap={MAX_CONNECTIONS} local={addr}"
+                    ));
+                    send_http(&mut stream, 503, "text/plain", b"too many connections");
+                    continue;
+                };
                 let app = app.clone();
-                thread::spawn(move || handle_client(stream, app));
+                thread::spawn(move || {
+                    let _guard = guard;
+                    handle_client(stream, app, opts);
+                });
             }
             Err(e) => log_line(&format!("accept error {e}")),
         }
     }
+}
+
+fn listen(addr: &str, app: Arc<Mutex<App>>, name: &str) {
+    let listener = bind_listener(addr).unwrap_or_else(|e| {
+        eprintln!("bind {addr} failed: {e}");
+        std::process::exit(1);
+    });
+    serve(listener, app, name, ServerOpts::default());
 }
 
 fn load_lobby_ini(path: &str) -> (i64, bool) {
@@ -2062,7 +2164,8 @@ fn load_lobby_ini(path: &str) -> (i64, bool) {
             match k.trim().to_ascii_lowercase().as_str() {
                 "max_players" => max = v.trim().parse().unwrap_or(max),
                 "override_game_max" => {
-                    override_game = matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes")
+                    override_game =
+                        matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes")
                 }
                 _ => {}
             }
@@ -2112,7 +2215,10 @@ fn main() {
             }
             "--http-port" => {
                 i += 1;
-                http_port = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(http_port);
+                http_port = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(http_port);
             }
             "--ws-port" => {
                 i += 1;

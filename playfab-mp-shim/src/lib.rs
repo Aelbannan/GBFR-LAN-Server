@@ -5,14 +5,25 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, c_void, CString};
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::io::Write;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 include!("../../common/lan_cfg.rs");
+
+/// Shared std-only JSON accessors, compiled from `common/json.rs`. Companion test:
+/// `common/json_test.rs`. Both shims and the test build the same file, so these parsers
+/// cannot drift apart the way the two hand-rolled copies did.
+#[path = "../../common/json.rs"]
+mod json;
+
+/// Shared blocking HTTP client, bounded on both ends (`common/http.rs`; tests in
+/// `common/http_test.rs`). One copy for both shims so the connect/read caps cannot drift.
+#[path = "../../common/http.rs"]
+mod http;
+use json::{json_arr_objects, json_escape, json_obj, json_str, json_u32};
 
 const S_OK: i32 = 0;
 const E_FAIL: i32 = 0x8000_4005u32 as i32;
@@ -48,7 +59,9 @@ fn log_path() -> String {
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        dir.join("playfab_mp_shim.log").to_string_lossy().into_owned()
+        dir.join("playfab_mp_shim.log")
+            .to_string_lossy()
+            .into_owned()
     })
     .clone()
 }
@@ -212,7 +225,11 @@ impl StateLog {
         }
         self.key = next;
         self.at = Instant::now();
-        if changed { 1 } else { 2 }
+        if changed {
+            1
+        } else {
+            2
+        }
     }
 }
 
@@ -294,36 +311,18 @@ fn http_json(method: &str, path: &str, body: &str) -> Option<String> {
 /// Bounded connect. The OS default connect timeout is ~21 s on Windows, and these calls run on
 /// the game's tick thread while the shim's global mutex is held, so a dead broker host would
 /// otherwise freeze the whole tick.
-fn connect_stub(host: &str, port: u16) -> Option<TcpStream> {
-    use std::net::ToSocketAddrs;
-    let addr = (host, port).to_socket_addrs().ok()?.next()?;
-    TcpStream::connect_timeout(&addr, Duration::from_millis(1000)).ok()
-}
-
 /// Same as `http_json`, but also returns the HTTP status so callers can tell a refusal from a
 /// success. `None` means no usable response at all (broker down, timeout, malformed reply);
 /// `.0 == 0` means the status line could not be parsed.
 fn http_json_status(method: &str, path: &str, body: &str) -> Option<(u16, String)> {
     let (host, port) = stub_host();
-    let mut stream = connect_stub(&host, port)?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
-    let auth = auth_header();
-    let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(req.as_bytes()).ok()?;
-    let mut buf = Vec::new();
-    let _ = stream.read_to_end(&mut buf);
-    let text = String::from_utf8_lossy(&buf);
-    let idx = text.find("\r\n\r\n")?;
-    let status = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse::<u16>().ok())
-        .unwrap_or(0);
-    Some((status, text[idx + 4..].to_string()))
+    match http::request(&host, port, method, path, body, auth_header().as_deref()) {
+        Ok(r) => Some((r.status, r.body)),
+        Err(e) => {
+            debug_log(&format!("http {method} {path} failed: {e:?}"));
+            None
+        }
+    }
 }
 
 /// Map the broker's PlayFab-shaped error envelope to the code the genuine SDK returns for the
@@ -371,123 +370,6 @@ fn truncate_log(s: &str, n: usize) -> String {
     }
 }
 
-fn skip_ws(b: &[u8], i: &mut usize) {
-    while *i < b.len() && b[*i].is_ascii_whitespace() {
-        *i += 1;
-    }
-}
-
-fn parse_json_string(b: &[u8], i: &mut usize) -> Option<String> {
-    if *i >= b.len() || b[*i] != b'"' {
-        return None;
-    }
-    *i += 1;
-    let mut out = Vec::new();
-    while *i < b.len() {
-        let c = b[*i];
-        if c == b'\\' {
-            *i += 1;
-            if *i >= b.len() {
-                break;
-            }
-            match b[*i] {
-                b'"' => out.push(b'"'),
-                b'\\' => out.push(b'\\'),
-                b'/' => out.push(b'/'),
-                b'n' => out.push(b'\n'),
-                b'r' => out.push(b'\r'),
-                b't' => out.push(b'\t'),
-                b'u' => {
-                    *i += 1;
-                    let hex_end = (*i + 4).min(b.len());
-                    if let Ok(hex) = std::str::from_utf8(&b[*i..hex_end]) {
-                        if let Ok(cp) = u32::from_str_radix(hex, 16) {
-                            if let Some(ch) = char::from_u32(cp) {
-                                let mut buf = [0u8; 4];
-                                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                            }
-                        }
-                    }
-                    *i = hex_end;
-                    continue;
-                }
-                other => out.push(other),
-            }
-            *i += 1;
-            continue;
-        }
-        if c == b'"' {
-            *i += 1;
-            return Some(String::from_utf8_lossy(&out).into_owned());
-        }
-        out.push(c);
-        *i += 1;
-    }
-    None
-}
-
-fn parse_json_nested(b: &[u8], i: &mut usize) -> String {
-    let start = *i;
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut esc = false;
-    while *i < b.len() {
-        let c = b[*i];
-        if in_str {
-            if esc {
-                esc = false;
-            } else if c == b'\\' {
-                esc = true;
-            } else if c == b'"' {
-                in_str = false;
-            }
-        } else {
-            match c {
-                b'"' => in_str = true,
-                b'{' | b'[' => depth += 1,
-                b'}' | b']' => {
-                    depth -= 1;
-                    *i += 1;
-                    if depth == 0 {
-                        return String::from_utf8_lossy(&b[start..*i]).into_owned();
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        *i += 1;
-    }
-    String::from_utf8_lossy(&b[start..*i]).into_owned()
-}
-
-fn parse_json_value(b: &[u8], i: &mut usize) -> String {
-    skip_ws(b, i);
-    if *i >= b.len() {
-        return String::new();
-    }
-    match b[*i] {
-        b'"' => parse_json_string(b, i).unwrap_or_default(),
-        b'{' | b'[' => parse_json_nested(b, i),
-        _ => {
-            let start = *i;
-            while *i < b.len()
-                && b[*i] != b','
-                && b[*i] != b'}'
-                && b[*i] != b']'
-                && !b[*i].is_ascii_whitespace()
-            {
-                *i += 1;
-            }
-            String::from_utf8_lossy(&b[start..*i]).into_owned()
-        }
-    }
-}
-
-fn json_u32(blob: &str, key: &str) -> Option<u32> {
-    json_str(blob, key)?.parse().ok()
-}
-
 fn json_max_players(blob: &str) -> u32 {
     json_u32(blob, "MaxPlayers")
         .or_else(|| json_u32(blob, "max_member"))
@@ -515,65 +397,6 @@ fn parse_access_policy(s: &str) -> u32 {
     }
 }
 
-fn json_str(blob: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\":");
-    let idx = blob.find(&pat)?;
-    let b = blob.as_bytes();
-    let mut i = idx + pat.len();
-    skip_ws(b, &mut i);
-    if i < b.len() && b[i] == b'"' {
-        parse_json_string(b, &mut i)
-    } else {
-        let v = parse_json_value(b, &mut i);
-        if v.is_empty() || v == "null" {
-            None
-        } else {
-            Some(v)
-        }
-    }
-}
-
-fn json_obj(blob: &str, key: &str) -> HashMap<String, String> {
-    let pat = format!("\"{key}\":");
-    let Some(idx) = blob.find(&pat) else {
-        return HashMap::new();
-    };
-    let b = blob.as_bytes();
-    let mut i = idx + pat.len();
-    skip_ws(b, &mut i);
-    if i >= b.len() || b[i] != b'{' {
-        return HashMap::new();
-    }
-    i += 1;
-    let mut map = HashMap::new();
-    loop {
-        skip_ws(b, &mut i);
-        if i >= b.len() || b[i] == b'}' {
-            break;
-        }
-        if b[i] == b',' {
-            i += 1;
-            continue;
-        }
-        let Some(k) = parse_json_string(b, &mut i) else {
-            break;
-        };
-        skip_ws(b, &mut i);
-        if i >= b.len() || b[i] != b':' {
-            break;
-        }
-        i += 1;
-        let v = parse_json_value(b, &mut i);
-        if !k.is_empty() {
-            map.insert(k, v);
-        }
-        if map.len() >= 64 {
-            break;
-        }
-    }
-    map
-}
-
 /// Read-only diagnostic: short printable preview of a string.
 fn preview_str(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -595,41 +418,6 @@ fn map_preview(m: &HashMap<String, CString>, max: usize) -> String {
         parts.push(format!("{k}={}", preview_str(&v, 48)));
     }
     preview_str(&parts.join(", "), max)
-}
-
-fn json_arr_objects(blob: &str, key: &str) -> Vec<String> {
-    let pat = format!("\"{key}\":[");
-    let Some(rest) = blob.split(&pat).nth(1) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut start = None;
-    for (i, c) in rest.char_indices() {
-        match c {
-            '{' => {
-                if depth == 0 {
-                    start = Some(i);
-                }
-                depth += 1;
-            }
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(s) = start {
-                        out.push(rest[s..=i].to_string());
-                    }
-                    start = None;
-                    if out.len() >= 32 {
-                        break;
-                    }
-                }
-            }
-            ']' if depth == 0 => break,
-            _ => {}
-        }
-    }
-    out
 }
 
 fn read_cstr(p: *const c_char) -> String {
@@ -660,7 +448,9 @@ fn intern(s: &str) -> *const c_char {
 /// contract keeps the change's key arrays valid until PFMultiplayerFinishProcessingLobbyStateChanges,
 /// and there is currently no reclaim path (see TODO.md). Counts are capped at 32, so the
 /// allocation size is bounded by the caller.
-unsafe fn intern_kv_arrays(map: &HashMap<String, String>) -> (u32, *const *const c_char, *const *const c_char) {
+unsafe fn intern_kv_arrays(
+    map: &HashMap<String, String>,
+) -> (u32, *const *const c_char, *const *const c_char) {
     let n = map.len().min(32);
     if n == 0 {
         return (0, ptr::null(), ptr::null());
@@ -696,22 +486,6 @@ fn intern_owner_key(row: &str) -> *const EntityKey {
         id: intern(&id),
         type_: intern(&ty),
     }))
-}
-
-fn json_escape(s: &str) -> String {
-    let mut o = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            '\r' => o.push_str("\\r"),
-            '\t' => o.push_str("\\t"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-            c => o.push(c),
-        }
-    }
-    o
 }
 
 /// # Safety
@@ -858,7 +632,7 @@ unsafe fn member_update_entries(updates: &[MemberUpdate]) -> (u32, *mut u8) {
     for (i, u) in updates.iter().enumerate() {
         let e = base.add(i * STRIDE);
         ptr::write_unaligned(e as *mut EntityKey, u.member);
-        ptr::write_unaligned(e.add(0x10) as *mut u8, u.connection_status_updated as u8);
+        ptr::write_unaligned(e.add(0x10), u.connection_status_updated as u8);
         let (n, keys) = intern_cstr_list(&u.property_keys);
         ptr::write_unaligned(e.add(0x14) as *mut u32, n);
         ptr::write_unaligned(e.add(0x18) as *mut *const *const c_char, keys);
@@ -868,7 +642,7 @@ unsafe fn member_update_entries(updates: &[MemberUpdate]) -> (u32, *mut u8) {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct EntityKey {
+pub struct EntityKey {
     id: *const c_char,
     type_: *const c_char,
 }
@@ -954,7 +728,6 @@ impl LobbyDelta {
 }
 
 struct Mp {
-    title: CString,
     token: Option<CString>,
     entity: Option<EntityKey>,
     /// Instance counter, incremented by PFMultiplayerInitialize. Broker jobs snapshot it so a
@@ -1099,9 +872,7 @@ fn ensure_broker_thread() {
 fn enqueue_job(job: BrokerJob) {
     ensure_broker_thread();
     let q = broker_queue();
-    q.q.lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push_back(job);
+    q.q.lock().unwrap_or_else(|e| e.into_inner()).push_back(job);
     q.cv.notify_one();
 }
 
@@ -1123,7 +894,9 @@ static SEARCH_PROP_LOG: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new
 /// Full create payloads already dumped, so each distinct one is logged exactly once.
 static CREATE_PAYLOAD_LOG: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
-fn auth_header() -> String {
+/// The PlayFab entity token as a ready-to-send header line (no trailing CRLF: the shared
+/// HTTP client terminates every header it writes).
+fn auth_header() -> Option<String> {
     let tok = AUTH
         .get_or_init(|| Mutex::new(String::new()))
         .lock()
@@ -1131,9 +904,9 @@ fn auth_header() -> String {
         .map(|g| g.clone())
         .unwrap_or_default();
     if tok.is_empty() {
-        String::new()
+        None
     } else {
-        format!("X-EntityToken: {tok}\r\n")
+        Some(format!("X-EntityToken: {tok}"))
     }
 }
 
@@ -1153,7 +926,10 @@ fn set_local_identity(entity: *const EntityKey, token: &str) {
     }
     if !entity.is_null() {
         let id = unsafe { read_cstr((*entity).id) };
-        if let Ok(mut g) = LOCAL_ENTITY.get_or_init(|| Mutex::new(String::new())).lock() {
+        if let Ok(mut g) = LOCAL_ENTITY
+            .get_or_init(|| Mutex::new(String::new()))
+            .lock()
+        {
             *g = id;
         }
     }
@@ -1173,8 +949,14 @@ fn g() -> &'static Mutex<Option<Box<Mp>>> {
     G.get_or_init(|| Mutex::new(None))
 }
 
+/// The global shim lock, recovering from a poisoned mutex. A panic while the state was held must
+/// not turn every later export into a panic across the FFI boundary (a game crash).
+fn mp_lock() -> std::sync::MutexGuard<'static, Option<Box<Mp>>> {
+    g().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn with_mp<R>(f: impl FnOnce(&mut Mp) -> R, default: R) -> R {
-    match g().lock().unwrap().as_mut() {
+    match mp_lock().as_mut() {
         Some(m) => f(m),
         None => default,
     }
@@ -1201,11 +983,18 @@ fn queue(m: &mut Mp, p: *mut u8) {
     // CHANGE 1: every enqueue is visible with its type and the resulting depth, so a change that
     // is never handed out can be named (exactly the guest's JoinLobbyCompleted + 2x MemberAdded).
     let ty = unsafe { ptr::read_unaligned(p as *const u32) };
-    debug_log(&format!("pfqueue queue type={ty} pending={}", m.pending.len()));
+    debug_log(&format!(
+        "pfqueue queue type={ty} pending={}",
+        m.pending.len()
+    ));
     probe_snapshot(m);
 }
 
-unsafe fn kv_list(count: u32, keys: *const *const c_char, vals: *const *const c_char) -> HashMap<String, String> {
+unsafe fn kv_list(
+    count: u32,
+    keys: *const *const c_char,
+    vals: *const *const c_char,
+) -> HashMap<String, String> {
     let mut map = HashMap::new();
     if keys.is_null() || vals.is_null() || count == 0 {
         return map;
@@ -1226,7 +1015,10 @@ unsafe fn kv_list(count: u32, keys: *const *const c_char, vals: *const *const c_
 
 fn apply_props(dst: &mut HashMap<String, CString>, src: HashMap<String, String>) {
     for (k, v) in src {
-        dst.insert(k, CString::new(v).unwrap_or_else(|_| CString::new("").unwrap()));
+        dst.insert(
+            k,
+            CString::new(v).unwrap_or_else(|_| CString::new("").unwrap()),
+        );
     }
 }
 
@@ -1306,11 +1098,17 @@ fn lobby_from_json(text: &str) -> Option<Box<Lobby>> {
     let conn = json_str(text, "ConnectionString").unwrap_or_else(|| format!("lan.{id}"));
     let mut props = HashMap::new();
     for (k, v) in json_obj(text, "LobbyData") {
-        props.insert(k, CString::new(v).unwrap_or_else(|_| CString::new("").unwrap()));
+        props.insert(
+            k,
+            CString::new(v).unwrap_or_else(|_| CString::new("").unwrap()),
+        );
     }
     let mut search = HashMap::new();
     for (k, v) in json_obj(text, "SearchData") {
-        search.insert(k, CString::new(v).unwrap_or_else(|_| CString::new("").unwrap()));
+        search.insert(
+            k,
+            CString::new(v).unwrap_or_else(|_| CString::new("").unwrap()),
+        );
     }
     let mut members = Vec::new();
     let mut member_props = HashMap::new();
@@ -1446,7 +1244,9 @@ fn find_row_live(row: &str) -> bool {
     let body = format!("{{\"LobbyId\":\"{}\"}}", json_escape(&id));
     let Some((status, got)) = http_json_status("POST", "/Lobby/GetLobby", &body) else {
         // No response at all: do not hide a possibly-live session over a transient blip.
-        log_line(&format!("FindLobbies probe id={id} no broker response (keeping row)"));
+        log_line(&format!(
+            "FindLobbies probe id={id} no broker response (keeping row)"
+        ));
         return true;
     };
     if status != 200 {
@@ -1520,7 +1320,7 @@ unsafe fn emit_member_added(m: &mut Mp, lobby: *mut Lobby, member: EntityKey) {
 unsafe fn announce_lobby_members(m: &mut Mp, lobby: *mut Lobby) {
     let owner = (*lobby).owner;
     emit_member_added(m, lobby, owner);
-    let members: Vec<EntityKey> = (*lobby).members.iter().copied().collect();
+    let members: Vec<EntityKey> = (*lobby).members.to_vec();
     for member in members {
         emit_member_added(m, lobby, member);
     }
@@ -1550,10 +1350,10 @@ unsafe fn emit_updated(m: &mut Mp, lobby: *mut Lobby, mut delta: LobbyDelta, for
         return;
     }
     ptr::write_unaligned(sc.add(8) as *mut *mut Lobby, lobby);
-    ptr::write_unaligned(sc.add(0x10) as *mut u8, delta.owner_updated as u8);
-    ptr::write_unaligned(sc.add(0x11) as *mut u8, delta.max_players_updated as u8);
-    ptr::write_unaligned(sc.add(0x12) as *mut u8, delta.access_policy_updated as u8);
-    ptr::write_unaligned(sc.add(0x13) as *mut u8, delta.membership_lock_updated as u8);
+    ptr::write_unaligned(sc.add(0x10), delta.owner_updated as u8);
+    ptr::write_unaligned(sc.add(0x11), delta.max_players_updated as u8);
+    ptr::write_unaligned(sc.add(0x12), delta.access_policy_updated as u8);
+    ptr::write_unaligned(sc.add(0x13), delta.membership_lock_updated as u8);
     let (sn, sk) = intern_cstr_list(&delta.search_keys);
     ptr::write_unaligned(sc.add(0x14) as *mut u32, sn);
     ptr::write_unaligned(sc.add(0x18) as *mut *const *const c_char, sk);
@@ -1592,7 +1392,12 @@ unsafe fn emit_updated(m: &mut Mp, lobby: *mut Lobby, mut delta: LobbyDelta, for
     queue(m, sc);
 }
 
-unsafe fn emit_join_completed(m: &mut Mp, lobby: *mut Lobby, joiner: EntityKey, async_ctx: *mut c_void) {
+unsafe fn emit_join_completed(
+    m: &mut Mp,
+    lobby: *mut Lobby,
+    joiner: EntityKey,
+    async_ctx: *mut c_void,
+) {
     // The identity getters answer E_PF_OBJECT_STILL_PENDING until this completion is queued.
     (*lobby).pending = false;
     // Documented order (PFMultiplayerJoinLobby): MemberAdded, then Updated, then
@@ -1636,10 +1441,7 @@ fn build_join_body(conn: &str, joiner_id: &str, member_kv: &HashMap<String, Stri
             member_data_json(joiner_id, member_kv)
         )
     };
-    format!(
-        "{{\"ConnectionString\":\"{}\"{member}}}",
-        json_escape(conn)
-    )
+    format!("{{\"ConnectionString\":\"{}\"{member}}}", json_escape(conn))
 }
 
 fn member_props_json_for(lobby: &Lobby, eid: &str) -> Option<String> {
@@ -1694,16 +1496,14 @@ fn build_update_body(
         ));
     }
     sd.push('}');
-    let target = member_target
-        .map(|s| s.to_string())
-        .or_else(|| {
-            let e = local_entity_id();
-            if e.is_empty() {
-                None
-            } else {
-                Some(e)
-            }
-        });
+    let target = member_target.map(|s| s.to_string()).or_else(|| {
+        let e = local_entity_id();
+        if e.is_empty() {
+            None
+        } else {
+            Some(e)
+        }
+    });
     let md = match &target {
         Some(eid) => member_props_json_for(lobby, eid)
             .map(|s| {
@@ -1781,7 +1581,10 @@ fn snapshot(l: &Lobby) -> LobbySnapshot {
 }
 
 /// Keys whose values were added, changed or removed between two property bags.
-fn changed_keys(before: &HashMap<String, CString>, after: &HashMap<String, CString>) -> Vec<String> {
+fn changed_keys(
+    before: &HashMap<String, CString>,
+    after: &HashMap<String, CString>,
+) -> Vec<String> {
     let mut keys: Vec<String> = Vec::new();
     for (k, v) in after {
         match before.get(k) {
@@ -1810,8 +1613,11 @@ unsafe fn entity_eq(a: &EntityKey, b: &EntityKey) -> bool {
 /// is derived from a real difference, so an unchanged lobby yields an empty delta and the
 /// caller emits nothing (a spurious change is as bad as a missing one).
 unsafe fn diff_lobby(before: &LobbySnapshot, after: &Lobby) -> LobbyDelta {
-    let mut d = LobbyDelta::default();
-    d.owner_updated = before.has_owner != after.has_owner || !entity_eq(&before.owner, &after.owner);
+    let mut d = LobbyDelta {
+        owner_updated: before.has_owner != after.has_owner
+            || !entity_eq(&before.owner, &after.owner),
+        ..LobbyDelta::default()
+    };
     d.max_players_updated = before.max_players != after.max_players;
     d.access_policy_updated = before.access_policy != after.access_policy;
     d.membership_lock_updated = before.membership_lock != after.membership_lock;
@@ -1869,7 +1675,10 @@ fn apply_refresh(
     }
     if let Some(mut fresh) = lobby_from_json(&text) {
         for (eid, mp) in &lobby.member_props {
-            let entry = fresh.member_props.entry(eid.clone()).or_insert_with(HashMap::new);
+            let entry = fresh
+                .member_props
+                .entry(eid.clone())
+                .or_insert_with(HashMap::new);
             for (k, v) in mp {
                 // Server MemberData wins when present (Steam KV). Local fills gaps only.
                 entry.entry(k.clone()).or_insert_with(|| v.clone());
@@ -1903,11 +1712,8 @@ fn apply_refresh(
         // the game removes their character. The exe's handler matches ctx+0x1d0 against SC+8 and
         // reads the EntityKey at SC+0x10, so both must be what we used for the other lobby SCs.
         if !lobby.members.is_empty() || !lobby.announced.is_empty() {
-            let live: std::collections::HashSet<String> = lobby
-                .members
-                .iter()
-                .map(|k| read_cstr(k.id))
-                .collect();
+            let live: std::collections::HashSet<String> =
+                lobby.members.iter().map(|k| read_cstr(k.id)).collect();
             departed = lobby
                 .announced
                 .iter()
@@ -1924,12 +1730,7 @@ fn apply_refresh(
 // Broker jobs and the worker loop.
 // ---------------------------------------------------------------------------
 
-unsafe fn queue_create_completed(
-    m: &mut Mp,
-    lobby: *mut Lobby,
-    async_ctx: *mut c_void,
-    code: i32,
-) {
+unsafe fn queue_create_completed(m: &mut Mp, lobby: *mut Lobby, async_ctx: *mut c_void, code: i32) {
     let sc = alloc_sc(0x20, 0);
     if sc.is_null() {
         return;
@@ -2051,7 +1852,7 @@ unsafe fn apply_join_response(
     if !d.members.iter().any(|m| read_cstr(m.id) == mid) {
         d.members.push(joiner);
     }
-    let entry = d.member_props.entry(mid.clone()).or_insert_with(HashMap::new);
+    let entry = d.member_props.entry(mid.clone()).or_default();
     apply_props(entry, member_kv.clone());
     ensure_member_props(entry, &mid);
 }
@@ -2149,7 +1950,11 @@ fn poll_all_lobbies() {
         Vec::new(),
     );
     for (lp, id) in targets {
-        let resp = http_json_status("POST", "/Lobby/GetLobby", &format!("{{\"LobbyId\":\"{id}\"}}"));
+        let resp = http_json_status(
+            "POST",
+            "/Lobby/GetLobby",
+            &format!("{{\"LobbyId\":\"{id}\"}}"),
+        );
         with_mp(
             |m| {
                 if m.lobbies.iter().all(|p| *p != lp) {
@@ -2237,8 +2042,8 @@ fn fail_join(job: &JoinJob, code: i32, status: u16, text: &str) {
 }
 
 fn run_join(job: JoinJob) {
-    let (status, text) = http_json_status("POST", "/Lobby/JoinLobby", &job.body)
-        .unwrap_or((0, String::new()));
+    let (status, text) =
+        http_json_status("POST", "/Lobby/JoinLobby", &job.body).unwrap_or((0, String::new()));
     if status != 200 {
         fail_join(&job, broker_error_code(status, &text), status, &text);
         return;
@@ -2247,8 +2052,12 @@ fn run_join(job: JoinJob) {
         fail_join(&job, E_PF_SERVICE_MALFORMED_RESPONSE, status, &text);
         return;
     };
-    let (gstatus, got) = http_json_status("POST", "/Lobby/GetLobby", &format!("{{\"LobbyId\":\"{id}\"}}"))
-        .unwrap_or((0, String::new()));
+    let (gstatus, got) = http_json_status(
+        "POST",
+        "/Lobby/GetLobby",
+        &format!("{{\"LobbyId\":\"{id}\"}}"),
+    )
+    .unwrap_or((0, String::new()));
     if gstatus != 200 {
         fail_join(&job, broker_error_code(gstatus, &got), gstatus, &got);
         return;
@@ -2288,8 +2097,8 @@ fn run_join(job: JoinJob) {
 }
 
 fn run_find(job: FindJob) {
-    let (status, text) = http_json_status("POST", "/Lobby/FindLobbies", &job.body)
-        .unwrap_or((0, String::new()));
+    let (status, text) =
+        http_json_status("POST", "/Lobby/FindLobbies", &job.body).unwrap_or((0, String::new()));
     let rows: Vec<String> = if status == 200 {
         json_arr_objects(&text, "Lobbies")
             .into_iter()
@@ -2339,15 +2148,13 @@ fn run_find(job: FindJob) {
                     let cur: u32 = json_str(row, "CurrentPlayers")
                         .and_then(|s| s.parse().ok())
                         .or_else(|| {
-                            row.split("\"CurrentPlayers\":")
-                                .nth(1)
-                                .and_then(|s| {
-                                    s.chars()
-                                        .take_while(|c| c.is_ascii_digit())
-                                        .collect::<String>()
-                                        .parse()
-                                        .ok()
-                                })
+                            row.split("\"CurrentPlayers\":").nth(1).and_then(|s| {
+                                s.chars()
+                                    .take_while(|c| c.is_ascii_digit())
+                                    .collect::<String>()
+                                    .parse()
+                                    .ok()
+                            })
                         })
                         .unwrap_or(1)
                         .clamp(1, max_member);
@@ -2387,8 +2194,8 @@ fn run_find(job: FindJob) {
 }
 
 fn run_leave(job: LeaveJob) {
-    let (status, text) = http_json_status("POST", "/Lobby/LeaveLobby", &job.body)
-        .unwrap_or((0, String::new()));
+    let (status, text) =
+        http_json_status("POST", "/Lobby/LeaveLobby", &job.body).unwrap_or((0, String::new()));
     let code = if status == 200 {
         0
     } else {
@@ -2419,8 +2226,8 @@ fn run_leave(job: LeaveJob) {
 }
 
 fn run_post(job: PostJob) {
-    let (status, text) = http_json_status("POST", "/Lobby/UpdateLobby", &job.body)
-        .unwrap_or((0, String::new()));
+    let (status, text) =
+        http_json_status("POST", "/Lobby/UpdateLobby", &job.body).unwrap_or((0, String::new()));
     let code = if status == 200 {
         0
     } else {
@@ -2478,11 +2285,7 @@ fn broker_thread_main() {
     loop {
         // Drain every queued operation first (the queue preserves call order).
         loop {
-            let job = q
-                .q
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pop_front();
+            let job = q.q.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
             match job {
                 Some(j) => run_broker_job(j),
                 None => break,
@@ -2493,9 +2296,8 @@ fn broker_thread_main() {
             poll_all_lobbies();
         } else {
             let guard = q.q.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = q
-                .cv
-                .wait_timeout(guard, Duration::from_millis(BROKER_WAIT_MS));
+            let _ =
+                q.cv.wait_timeout(guard, Duration::from_millis(BROKER_WAIT_MS));
         }
     }
 }
@@ -2519,7 +2321,6 @@ pub unsafe extern "C" fn PFMultiplayerInitialize(
         title.to_string_lossy()
     ));
     let mut boxed = Box::new(Mp {
-        title,
         token: None,
         entity: None,
         generation,
@@ -2533,7 +2334,7 @@ pub unsafe extern "C" fn PFMultiplayerInitialize(
     });
     *handle = boxed.as_mut() as *mut Mp as *mut c_void;
     probe_snapshot(&boxed);
-    *g().lock().unwrap() = Some(boxed);
+    *mp_lock() = Some(boxed);
     start_queue_heartbeat();
     ensure_broker_thread();
     S_OK
@@ -2624,6 +2425,17 @@ pub unsafe extern "C" fn PFMultiplayerCreateAndJoinLobby(
         let search_count = ptr::read_unaligned(create_cfg.add(12) as *const u32);
         let search_keys = ptr::read_unaligned(create_cfg.add(16) as *const *const *const c_char);
         let search_vals = ptr::read_unaligned(create_cfg.add(24) as *const *const *const c_char);
+        // P0 (IMPL-2 item 3; 6P-GROUND-IMM I6 value half, field identity per 6P-SDK-HEADERS H1):
+        // log the raw create-config words +12/+16/+24 (searchPropertyCount/keys/vals) on every
+        // create. Creates are one-shot per lobby (never per-frame), so this is flood-safe.
+        // Log-only: formats and logs; no caller of these locals changes.
+        // R1: skip the ~100 B format! when debug is off; debug-on identical.
+        if debug_enabled() {
+            debug_log(&format!(
+                "CreateAndJoinLobby create_cfg+12 search_count={search_count} keys={:p} vals={:p}",
+                search_keys, search_vals
+            ));
+        }
         search = kv_list(search_count, search_keys, search_vals);
         let lobby_count = ptr::read_unaligned(create_cfg.add(32) as *const u32);
         let lobby_keys = ptr::read_unaligned(create_cfg.add(40) as *const *const *const c_char);
@@ -2913,24 +2725,24 @@ pub unsafe extern "C" fn PFMultiplayerStartProcessingLobbyStateChanges(
             // before Finish, `in_flight` still belongs to it, so leave it untouched and re-return
             // it below. Queued changes stay in `pending` for the next real batch.
             if !m.batch_outstanding {
-            m.in_flight.clear();
-            while let Some(p) = m.pending.pop_front() {
-                if BATCH_CAP_ENABLED && m.in_flight.len() >= BATCH_CAP {
-                    // CHANGE 2(a), PF-15/D4: the cap is off by default because the SDK returns the
-                    // whole batch. The old loop dropped the change it had just popped; when the cap
-                    // is switched back on, requeue it instead and say so.
-                    log_throttled(
+                m.in_flight.clear();
+                while let Some(p) = m.pending.pop_front() {
+                    if BATCH_CAP_ENABLED && m.in_flight.len() >= BATCH_CAP {
+                        // CHANGE 2(a), PF-15/D4: the cap is off by default because the SDK returns the
+                        // whole batch. The old loop dropped the change it had just popped; when the cap
+                        // is switched back on, requeue it instead and say so.
+                        log_throttled(
                         "in_flight_cap",
                         &format!(
                             "pfqueue batch_cap hit cap={BATCH_CAP} pending={} (change stays queued)",
                             m.pending.len() + 1
                         ),
                     );
-                    m.pending.push_front(p);
-                    break;
+                        m.pending.push_front(p);
+                        break;
+                    }
+                    m.in_flight.push(p);
                 }
-                m.in_flight.push(p);
-            }
                 m.batch_outstanding = !m.in_flight.is_empty();
                 if m.batch_outstanding {
                     // CHANGE 1b: cumulative nonzero-batch count for the hb summary.
@@ -3095,7 +2907,10 @@ pub unsafe extern "C" fn PFLobbyGetLobbyId(lobby: *mut c_void, out: *mut *const 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn PFLobbyGetConnectionString(lobby: *mut c_void, out: *mut *const c_char) -> i32 {
+pub unsafe extern "C" fn PFLobbyGetConnectionString(
+    lobby: *mut c_void,
+    out: *mut *const c_char,
+) -> i32 {
     if lobby.is_null() || out.is_null() {
         return E_FAIL;
     }
@@ -3118,11 +2933,7 @@ pub unsafe extern "C" fn PFLobbyGetLobbyProperty(
     }
     let k = read_cstr(key);
     let l = &*(lobby as *mut Lobby);
-    let mut val = l
-        .props
-        .get(&k)
-        .map(|c| c.as_ptr())
-        .unwrap_or(ptr::null());
+    let mut val = l.props.get(&k).map(|c| c.as_ptr()).unwrap_or(ptr::null());
     // A real service returns whatever the title stored, placeholder included (genuine Party even
     // has a dedicated "network descriptor is a placeholder" error; see MS_DLL_GROUND_TRUTH §4.4).
     // The shim's own join gate refuses to complete a join until the stored descriptor is real
@@ -3169,11 +2980,7 @@ pub unsafe extern "C" fn PFLobbyGetSearchProperty(
     }
     let k = read_cstr(key);
     let l = &*(lobby as *mut Lobby);
-    *out = l
-        .search
-        .get(&k)
-        .map(|c| c.as_ptr())
-        .unwrap_or(ptr::null());
+    *out = l.search.get(&k).map(|c| c.as_ptr()).unwrap_or(ptr::null());
     let shown = if (*out).is_null() {
         "null".to_string()
     } else {
@@ -3455,7 +3262,7 @@ pub unsafe extern "C" fn PFLobbyPostUpdate(
         let mu_vals = ptr::read_unaligned(member_update.add(24) as *const *const *const c_char);
         let (mu_sets, mu_del) = kv_list_split(mu_count, mu_keys, mu_vals);
         if !mid.is_empty() && (!mu_sets.is_empty() || !mu_del.is_empty()) {
-            let entry = l.member_props.entry(mid.clone()).or_insert_with(HashMap::new);
+            let entry = l.member_props.entry(mid.clone()).or_default();
             apply_props(entry, mu_sets);
             drop_props(entry, &mu_del);
             ensure_member_props(entry, &mid);
@@ -3471,22 +3278,23 @@ pub unsafe extern "C" fn PFLobbyPostUpdate(
     debug_throttled(
         "postupdate",
         &format!(
-        "PostUpdate id={} props={} desc={} inv={}",
-        l.id.to_string_lossy(),
-        l.props.len(),
-        l.props
-            .get("network_descriptor")
-            .map(|c| {
-                let s = c.to_string_lossy();
-                if is_real_network_descriptor(&s) {
-                    "LAN1"
-                } else {
-                    "hidden"
-                }
-            })
-            .unwrap_or("none"),
-        l.props.contains_key("invitation_identifier")
-    ));
+            "PostUpdate id={} props={} desc={} inv={}",
+            l.id.to_string_lossy(),
+            l.props.len(),
+            l.props
+                .get("network_descriptor")
+                .map(|c| {
+                    let s = c.to_string_lossy();
+                    if is_real_network_descriptor(&s) {
+                        "LAN1"
+                    } else {
+                        "hidden"
+                    }
+                })
+                .unwrap_or("none"),
+            l.props.contains_key("invitation_identifier")
+        ),
+    );
     // The real service applies the update and pushes a PFLobbyUpdatedStateChange back to
     // every member including the author; only then does the title's view reflect it
     // (PFLobbyPostUpdate docs). The shim applies locally for its own getters, so the
@@ -3589,7 +3397,10 @@ pub unsafe extern "C" fn PFLobbyForceRemoveMember(
 #[no_mangle]
 pub extern "system" fn DllMain(_m: *mut c_void, reason: u32, _r: *mut c_void) -> i32 {
     if reason == 1 {
-        debug_log("PlayFabMultiplayerWin.dll LAN stub loaded");
+        debug_log(concat!(
+            "PlayFabMultiplayerWin.dll LAN stub loaded build=",
+            env!("BUILD_STAMP")
+        ));
     }
     1
 }
