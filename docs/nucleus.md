@@ -85,3 +85,4 @@ on each client.
 | Instances see stale shims after an update | re-run `install_nucleus.ps1` and **reload the handler**, then delete existing instance folders so the reset copies the new package |
 | Goldberg blocks a non-LAN connection | `steam_settings\disable_lan_only.txt` exists in the handler/instance folder |
 | One instance writes logs where another expects them | logs live in each instance's game folder (separate `steam_http_shim.log`, `playfab_mp_shim.log`, `party_shim.log`) |
+| Game crashes at boot in `gbfr_http.dll`, fault offset ~`0x33F2` | **fixed 2026-09-17**: the IAT patcher (`iat_replace`) walked a concurrently-modified import table without bounds/`VirtualProtect` checks and wrote to a bogus thunk. Rebuild `gbfr_http.dll` from the current source (it now validates `SizeOfImage`, every RVA, and the protect call). Stale binaries will still crash intermittently. |

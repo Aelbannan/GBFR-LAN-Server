@@ -119,6 +119,10 @@ One message per datagram. Header **v3** is 60 bytes (the ack field is present):
 With `PARTY_RELIABLE = false` the shim falls back to the old **v2** 56-byte header (no ack,
 one global sequence counter, no retransmits) — a debug switch, not a supported mode.
 
+The packing and parsing live in `party-shim/src/wire.rs` (one function per direction, every
+length checked before use); `party-shim/tests/wire_test.rs` asserts the offsets above in both
+protocol versions and feeds every truncation of a valid datagram back through the parser.
+
 Sends are currently broadcast to every known remote (the target-endpoint list is ignored;
 the game passes one target, so in a 2-player session this is identical). Messages are sent
 as one datagram each; oversized payloads are refused with an error rather than fragmented.

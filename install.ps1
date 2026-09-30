@@ -42,9 +42,19 @@ function Install-GameDll {
     $bak = Join-Path $GameDir ($Name + ".ms")
     if (Test-Path $dest) {
         $len = (Get-Item $dest).Length
-        if ($len -ge $OrigMinBytes -and -not (Test-Path $bak)) {
-            Copy-Item -Force $dest $bak
-            Write-Host "Backed up $Name ($len bytes) -> $Name.ms"
+        if ($len -ge $OrigMinBytes) {
+            # Back up when there is no backup, or when the installed file is no longer the one
+            # that was backed up (a game update replaces the shipping DLL). Without the second
+            # check the .ms file stays stale forever and the updated original is lost on the
+            # next install.
+            $stale = $true
+            if (Test-Path $bak) {
+                $stale = (Get-FileHash $dest).Hash -ne (Get-FileHash $bak).Hash
+            }
+            if ($stale) {
+                Copy-Item -Force $dest $bak
+                Write-Host "Backed up $Name ($len bytes) -> $Name.ms"
+            }
         }
     }
     Copy-Item -Force $Built $dest
@@ -71,4 +81,4 @@ Write-Host "  1. Edit $gameIni if the host is another PC ([server] host)."
 Write-Host "  2. On the host PC, run $GameDir\gbfr-lan-server.exe"
 Write-Host "  3. Launch the game and use the multiplayer quest counter."
 Write-Host ""
-Write-Host "Logs: steam_http_shim.log, playfab_mp_shim.log, party_shim.log next to the game exe."
+Write-Host "Logs: steam_http_shim.log, playfab_mp_shim.log, party_shim.log, gbfr-lan-server.log next to the game exe."

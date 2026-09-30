@@ -65,8 +65,12 @@ playfab-mp-shim\PlayFabMultiplayerWin.dll
 lan-server\gbfr-lan-server.exe
 ```
 
-Each component can also be built on its own with its `build.ps1`. The shims only need
-`rustc`; the server builds with Cargo.
+Each component can also be built on its own with its `build.ps1`. All four are members of the
+Cargo workspace in the root `Cargo.toml`, so `cargo build --release`, `cargo fmt` and
+`cargo clippy` cover the whole stack in one pass. The shims deliberately keep the default
+unwind panic strategy: their transport and broker threads recover from a panic with
+`catch_unwind` and fall back to the inline path, which `panic = "abort"` would turn into a
+game crash.
 
 ## Install
 
@@ -174,35 +178,30 @@ Party worker threads), `GBFR_LAN_INI=<path>` (server's ini path).
 
 ## Tests
 
-Reliable-delivery logic (pure, no DLL needed):
+Build all four components and run every suite with one command:
 
 ```powershell
-cd party-shim
-rustc -O -o reliable_test.exe reliable_test.rs
-.\reliable_test.exe
+powershell -ExecutionPolicy Bypass -File run_tests.ps1
 ```
 
-Broker/transport integration for `PartyWin.dll` (mock broker runs in-process; build the
-shim first and put `PartyWin.dll` next to the test exe):
+`-SkipBuild` reuses the binaries already in the component folders. The suites are:
 
-```powershell
-cd party-shim
-rustc --edition 2021 -O -o broker_http_test.exe broker_http_test.rs
-.\broker_http_test.exe            # full threaded flow
-.\broker_http_test.exe --loss     # retransmit/ack over loss
-.\broker_http_test.exe --outage   # broker silently down, then recovery
-```
+| Suite | Covers |
+|---|---|
+| `common/json_test` | JSON field accessors shared by both shims (escapes, nesting, malformed input) |
+| `common/http_test` | The bounded HTTP client: connect cap, response cap, status parsing, dead ports |
+| `lan-server` (`cargo test`) | Lobby filter/sort, boot blob, Cygames + PlayFab + Party routes, WebSocket pump, HTTP framing, oversized bodies, the connection cap |
+| `party-shim/reliable_test` | The reliable-delivery state machine under loss, duplication and reordering |
+| `party-shim/wire_test` | UDP header layout (v2 and v3), truncation safety, payload hints, `LAN1.` parsing |
+| `party-shim/broker_http_test` | `PartyWin.dll` against a mock broker: full flow, `--loss`, `--outage` |
+| `playfab-mp-shim/async_broker_test` | The async broker contract and the instance-generation guard |
+| `playfab-mp-shim/pfqueue_smoke` | State-change queue lifecycle and heartbeat |
+| `playfab-mp-shim/postupdate_smoke` | Real broker on port 18080: create/read/delete/PostUpdate round trip |
+| `steam-http-shim/pe_test` | PE import patching against a synthetic image with a guard page; ABI packing |
 
-PlayFab lobby smoke test (start the broker on a test port first):
-
-```powershell
-lan-server\gbfr-lan-server.exe --http-port 18080 --ws-port 18081
-$env:GBFR_LAN_STUB = "127.0.0.1:18080"
-cd playfab-mp-shim
-rustc tests\postupdate_smoke.rs -o tests\postupdate_smoke.exe
-tests\postupdate_smoke.exe PlayFabMultiplayerWin.dll
-```
-
+Individual suites can still be built by hand with `rustc`, as each test file's header documents.
+`cargo fmt --all -- --check` and `cargo clippy --workspace --release -- -D warnings` must stay
+clean too; CI enforces both.
 ## How it works
 
 - `gbfr_http.dll` replaces the ISteamHTTP vtable after `SteamAPI_Init` and hooks

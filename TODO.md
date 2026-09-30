@@ -3,22 +3,36 @@
 Notes from a code review, roughly ordered by value. None of these are needed for the mod to
 work as-is.
 
-## Hardening (trusted-LAN threat model)
+## Done (kept for the record)
 
-The design assumes the network is trusted (plain HTTP, no auth, no TLS), so these improve
-failure modes — they do not create a security boundary.
-
-- [ ] **lan-server: cap request bodies.** `read_request` trusts `Content-Length` and grows the
-  body unbounded (`main.rs:1846`); the 1 MB guard only covers headers. Reject/close oversize
-  bodies (the game never posts anything close to 1 MB).
-- [ ] **lan-server: cap concurrent connections.** `listen()` spawns a thread per accepted socket
-  with no limit; combined with the next item a peer can pile up threads without sending a byte.
-- [ ] **lan-server: WebSocket idle timeout.** Connections on the WS port get
-  `header_timeout = None` (`main.rs:1874`) and `set_read_timeout(None)` in `pump_websocket`, so an
-  idle socket holds a thread forever. Add a generous idle timeout (the game reconnects).
-- [ ] **shims: cap HTTP response reads.** `http_json_status` in `party-shim` and
-  `playfab-mp-shim` uses `read_to_end` with no size limit; the 3 s read timeout is per read, not
-  overall.
+- [x] **Tests.** `run_tests.ps1` builds all four components and runs every suite. New coverage:
+  `common/json_test`, `common/http_test`, `lan-server` integration/framing tests, `party-shim/wire_test`,
+  `steam-http-shim/pe_test`. CI runs the runner plus `cargo fmt --check` and `cargo clippy -D warnings`.
+- [x] **lan-server: cap request bodies.** `read_request` refuses a declared body over
+  `MAX_BODY_BYTES` (1 MB) with a 413 before reading a byte of it; the per-read header timeout
+  remains a slowloris bound rather than a hard one.
+- [x] **lan-server: cap concurrent connections.** `MAX_CONNECTIONS` (256) with an RAII slot per
+  accepted socket; over the cap the connection gets a 503 instead of a thread.
+- [x] **lan-server: WebSocket idle timeout.** `pump_websocket` uses a 900 s read timeout
+  (`ServerOpts::ws_idle`, 300 ms in tests) instead of `None`.
+- [x] **shims: cap HTTP response reads.** Both shims use `common/http.rs`: 1 s connect cap and a
+  4 MB response cap, with the status/body parsing in one tested place.
+- [x] **Shared JSON accessors.** `common/json.rs` replaces both hand-rolled copies (the
+  `json_str` drift is gone); lookups handle escapes, nesting and malformed input.
+- [x] **Panic strategy decided.** Keep unwind. The Party shim's transport and broker threads use
+  `catch_unwind` and fall back to the inline path; `panic = "abort"` would turn a recoverable
+  worker panic into a game crash. (An earlier review suggested `abort`; that was wrong.)
+- [x] **Poisoned-mutex recovery.** `g_lock` / `mp_lock` / `state_lock` recover instead of
+  `.lock().unwrap()`, so a panic while a lock was held cannot turn every later export into an
+  abort across the FFI boundary.
+- [x] **Single build path.** Root Cargo workspace; each `build.ps1` builds its member and copies
+  the artifact. The raw-`rustc` build was removed (it produced a different binary from the same
+  source, and only one path can be the shipping one).
+- [x] **Formatting and lints.** Tree is `cargo fmt` clean; `cargo clippy --workspace --release`
+  is warning-free; rustc warnings are gone (private-interface lints, dead fields, unused imports).
+- [x] **install.ps1: stale backups.** A shipping DLL that differs from the existing `.ms` backup
+  is re-backed-up, so a game update no longer loses the new original.
+- [x] **`async_broker_test` in CI** (via the runner), plus `pfqueue_smoke` and `wire_test`.
 
 ## Known leak (measure before fixing)
 
@@ -32,13 +46,26 @@ failure modes — they do not create a security boundary.
 
 ## Refactors (maintainability, not bugs)
 
-- [ ] **party-shim JSON scrapers.** `json_str` / `json_num` / `json_arr_objects` (~line 992) are
-  only used for `/party/peers` (entity_id/ip/udp_port). If the broker contract grows, share the
-  escape-aware parser from `playfab-mp-shim` via `common/` instead of extending the scrapers.
-- [ ] **Split the large files.** `party-shim/src/lib.rs` (5.6k lines),
-  `playfab-mp-shim/src/lib.rs` (3.1k), `lan-server/src/main.rs` (2.0k). Start with the
-  game-memory probes and broker threads in party, and service routing in the server.
-- [ ] **Build hygiene.** Clean or gate the build warnings (function casts, private interfaces,
-  unused assignments); decide `cargo` vs raw `rustc` for the shims — the `Cargo.toml` files exist
-  but the documented build bypasses them, and `panic=abort` would be appropriate for a cdylib.
+- [ ] **Split the large files.** `party-shim/src/lib.rs` (~5.6k lines), `playfab-mp-shim/src/lib.rs`
+  (~3.6k), `lan-server/src/main.rs` (~2.2k). Concretely:
+  - about a third of `party-shim/src/lib.rs` is diagnostics (`solo_sample_note` 165 lines,
+    `probe_session` 141, `mode3_gate_note` 104, `log_payload` 98, `asyncload_note` 63,
+    `quest_guard_note` 55, `note_eventbus` 52, ...): move the debug-gated probes into
+    `src/diagnostics.rs`, or delete the one-off RE instruments;
+  - `lan-server`: split `handle_playfab` (496 lines) and `handle_party` (172) by route, and fold
+    `load_lobby_ini` into `common/lan_cfg.rs` (also drops the second `parse_bool`);
+  - `steam-http`: split `winhttp_execute` (153 lines) into URL build / send / response parse.
+- [ ] **`lan-server`: fold `[lobby]` into `LanCfg`.** `load_lobby_ini` is a second ini parser next
+  to `common/lan_cfg.rs`; the server pre-scans `--ini` and sets `GBFR_LAN_INI` so the shared loader
+  sees it, which is easy to break.
+- [ ] **Pre-upgrade WebSocket connections have no header timeout** (`header_timeout = None` on the
+  WS port, deliberately: WinHTTP connects at `user_auth` and sends the upgrade much later). The
+  connection cap bounds the damage; a generous timeout would bound it better, but it must be long
+  enough not to cut a player who is idling at the multiplayer counter.
+- [ ] **Delete or archive `dev/lan-stub`.** It is a stale pre-git copy of the same stack (different
+  sources, old install scripts, scratch dirs). Editing the wrong tree is the failure mode.
+
+## Legal / packaging
+
 - [ ] **LICENSE.** Not chosen yet.
+- [ ] **Decide what ships.** Built DLLs/EXEs are gitignored; `lan.ini` is tracked.

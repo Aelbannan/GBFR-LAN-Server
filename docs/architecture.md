@@ -280,6 +280,12 @@ and the mesh collapse to one peer.
 ## Server internals and limits
 
 - One `Arc<Mutex<App>>` state; one thread per HTTP/WS connection; no background thread.
+- Hard caps, so a peer cannot grow the server without bound: request bodies are refused with
+  a 413 above 1 MB (`MAX_BODY_BYTES`), at most 256 sockets are served concurrently (a further
+  connection gets a 503 rather than a thread, `MAX_CONNECTIONS`), the header block is capped
+  at 1 MB, non-WebSocket connections have a 15 s per-read header timeout, and an upgraded
+  WebSocket that has been silent for 900 s is closed (`ServerOpts::ws_idle`). The game's own
+  traffic is orders of magnitude below all of these.
 - Locking is poison-tolerant (`unwrap_or_else(into_inner)`); the whole state lock is never
   held across I/O.
 - Lobbies have no TTL; they live until leave/owner-leave or process exit. Party rows expire
@@ -287,3 +293,19 @@ and the mesh collapse to one peer.
 - Logs: `gbfr-lan-server.log` next to the server exe (`steam_http_shim.log`,
   `playfab_mp_shim.log`, `party_shim.log` for the clients). The broker log includes a
   normalised request path for every call and a `catch-all POST …` line for unknown POSTs.
+
+## Shim internals and limits
+
+- Both broker-calling shims use `common/http.rs`: a 1 s connect cap (the OS default is ~21 s,
+  which used to freeze the game's tick thread on a dead broker host) and a 4 MB response cap
+  (`MAX_RESPONSE_BYTES`) instead of an unbounded `read_to_end`. A read error mid-body still
+  yields the partial response; only an oversized body or a missing header terminator fail.
+- The JSON field accessors in `common/json.rs` are shared, so the two shims cannot drift on
+  escape handling again; `common/json_test.rs` and `common/http_test.rs` cover both modules.
+- The shims keep the unwind panic strategy: the Party transport and broker threads recover from
+  a panic with `catch_unwind` and fall back to the inline path, and the global locks recover
+  from poisoning, so a panic cannot turn every later export into an abort across the FFI
+  boundary. `panic = "abort"` would disable that recovery.
+- PE import patching (`steam-http-shim/src/pe.rs`) bounds every read and write by the module's
+  `SizeOfImage` and every string scan by the image end; `tests/pe_test.rs` runs it against a
+  synthetic image whose guard page makes an out-of-bounds walk crash the test.
