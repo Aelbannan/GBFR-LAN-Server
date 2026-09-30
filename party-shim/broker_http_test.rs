@@ -314,7 +314,8 @@ impl FakeMembers {
             PAGE_READWRITE,
         );
         assert!(!global.is_null(), "VirtualAlloc member-list slot failed");
-        let container = VirtualAlloc(null_mut(), 0x1000, MEM_COMMIT_RESERVE, PAGE_READWRITE) as *mut u8;
+        let container =
+            VirtualAlloc(null_mut(), 0x1000, MEM_COMMIT_RESERVE, PAGE_READWRITE) as *mut u8;
         let elems = VirtualAlloc(null_mut(), 0x1000, MEM_COMMIT_RESERVE, PAGE_READWRITE) as *mut u8;
         let inner = VirtualAlloc(null_mut(), 0x2000, MEM_COMMIT_RESERVE, PAGE_READWRITE) as *mut u8;
         assert!(!container.is_null() && !elems.is_null() && !inner.is_null());
@@ -373,10 +374,19 @@ type MkNetFn = unsafe extern "C" fn(
     *mut u8,
 ) -> u32;
 type ConnectFn = unsafe extern "C" fn(H, *const u8, *mut c_void, *mut H) -> u32;
-type MkEpFn = unsafe extern "C" fn(H, H, u32, *const *const u8, *const c_void, *mut c_void, *mut H) -> u32;
+type MkEpFn =
+    unsafe extern "C" fn(H, H, u32, *const *const u8, *const c_void, *mut c_void, *mut H) -> u32;
 type EpEntityFn = unsafe extern "C" fn(H, *mut *const c_char) -> u32;
-type SendFn =
-    unsafe extern "C" fn(H, u32, *const *mut c_void, u32, *const c_void, u32, *const u8, *mut c_void) -> u32;
+type SendFn = unsafe extern "C" fn(
+    H,
+    u32,
+    *const *mut c_void,
+    u32,
+    *const c_void,
+    u32,
+    *const u8,
+    *mut c_void,
+) -> u32;
 type LeaveFn = unsafe extern "C" fn(H, *mut c_void) -> u32;
 type CleanupFn = unsafe extern "C" fn(H) -> u32;
 type StartFn = unsafe extern "C" fn(H, *mut u32, *mut *mut *mut u8) -> u32;
@@ -390,7 +400,11 @@ extern "system" {
 
 unsafe fn sym(h: H, name: &[u8]) -> *mut c_void {
     let p = GetProcAddress(h, name.as_ptr());
-    assert!(!p.is_null(), "missing export {}", String::from_utf8_lossy(name));
+    assert!(
+        !p.is_null(),
+        "missing export {}",
+        String::from_utf8_lossy(name)
+    );
     p
 }
 
@@ -569,7 +583,8 @@ fn run_fallback_mode() {
         let send: SendFn = std::mem::transmute(sym(dll, b"PartyEndpointSendMessage\0"));
         let cleanup: CleanupFn = std::mem::transmute(sym(dll, b"PartyCleanup\0"));
         let start: StartFn = std::mem::transmute(sym(dll, b"PartyStartProcessingStateChanges\0"));
-        let finish: FinishFn = std::mem::transmute(sym(dll, b"PartyFinishProcessingStateChanges\0"));
+        let finish: FinishFn =
+            std::mem::transmute(sym(dll, b"PartyFinishProcessingStateChanges\0"));
 
         let mut handle: H = null_mut();
         check(
@@ -606,7 +621,8 @@ fn run_fallback_mode() {
         let mut local_ep: H = null_mut();
         check(
             "fallback CreateEndpoint",
-            mk_ep(net, user, 0, null(), null(), null_mut(), &mut local_ep) == 0 && !local_ep.is_null(),
+            mk_ep(net, user, 0, null(), null(), null_mut(), &mut local_ep) == 0
+                && !local_ep.is_null(),
             "",
         );
 
@@ -620,12 +636,19 @@ fn run_fallback_mode() {
             types_seen: Vec::new(),
             remote_eps: Vec::new(),
         };
-        pump.pump_until(|p| p.types_seen.contains(&3) && p.types_seen.contains(&10), Duration::from_secs(3));
+        pump.pump_until(
+            |p| p.types_seen.contains(&3) && p.types_seen.contains(&10),
+            Duration::from_secs(3),
+        );
         let got_guest = pump.pump_until(
             |p| p.remote_eps.iter().any(|(e, _)| e == "guest"),
             Duration::from_secs(6),
         );
-        check("fallback inline poll becomes a remote endpoint", got_guest, "");
+        check(
+            "fallback inline poll becomes a remote endpoint",
+            got_guest,
+            "",
+        );
 
         // Point the remote endpoint at a socket we can observe: send a datagram from "guest",
         // which the inline receive path must adopt, then give the tick a moment to process it.
@@ -633,7 +656,8 @@ fn run_fallback_mode() {
         udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         let shim_port = u16::from_le_bytes([desc[57], desc[58]]);
         let pkt = wire_packet("guest", 0x3, 1, b"op5 sub3 fallback");
-        udp.send_to(&pkt, ("127.0.0.1", shim_port)).expect("fallback send datagram");
+        udp.send_to(&pkt, ("127.0.0.1", shim_port))
+            .expect("fallback send datagram");
         pump.pump_for(Duration::from_millis(100));
 
         // One Party send must reach that socket synchronously (inline send_udp_all).
@@ -644,13 +668,27 @@ fn run_fallback_mode() {
             _pad: 0,
         };
         let t0 = Instant::now();
-        let sr = send(local_ep, 1, null(), 0x2, null(), 1, &b as *const DataBuffer as *const u8, null_mut());
+        let sr = send(
+            local_ep,
+            1,
+            null(),
+            0x2,
+            null(),
+            1,
+            &b as *const DataBuffer as *const u8,
+            null_mut(),
+        );
         let send_ms = t0.elapsed().as_millis();
-        check("fallback send call succeeds", sr == 0, &format!("r={sr:#x} took={send_ms}ms"));
+        check(
+            "fallback send call succeeds",
+            sr == 0,
+            &format!("r={sr:#x} took={send_ms}ms"),
+        );
 
         let mut got = false;
         let mut rbuf = [0u8; 512];
-        udp.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        udp.set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             pump.tick();
@@ -691,7 +729,11 @@ fn run_fallback_mode() {
         check(
             "fallback tick stays responsive",
             pump.max_tick < Duration::from_millis(100),
-            &format!("max_tick={}ms ticks={}", pump.max_tick.as_millis(), pump.ticks),
+            &format!(
+                "max_tick={}ms ticks={}",
+                pump.max_tick.as_millis(),
+                pump.ticks
+            ),
         );
         let _ = cleanup(handle);
     }
@@ -784,7 +826,11 @@ unsafe fn boot_shim(label: &str, members: &[&str]) -> Booted {
         desc.as_mut_ptr(),
         null_mut(),
     );
-    check(&format!("{label} CreateNewNetwork"), r == 0, &format!("r={r:#x}"));
+    check(
+        &format!("{label} CreateNewNetwork"),
+        r == 0,
+        &format!("r={r:#x}"),
+    );
     let mut net: H = null_mut();
     check(
         &format!("{label} ConnectToNetwork"),
@@ -794,7 +840,8 @@ unsafe fn boot_shim(label: &str, members: &[&str]) -> Booted {
     let mut local_ep: H = null_mut();
     check(
         &format!("{label} CreateEndpoint"),
-        (f.mk_ep)(net, user, 0, null(), null(), null_mut(), &mut local_ep) == 0 && !local_ep.is_null(),
+        (f.mk_ep)(net, user, 0, null(), null(), null_mut(), &mut local_ep) == 0
+            && !local_ep.is_null(),
         "",
     );
     let mut pump = Pump {
@@ -842,10 +889,12 @@ fn run_loss_mode() {
     // Adopt this socket as the remote endpoint's address. The shim answers the guaranteed hello
     // with a standalone ack; drain whatever is already queued before the measurement.
     let udp = UdpSocket::bind("127.0.0.1:0").expect("loss udp bind");
-    udp.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+    udp.set_read_timeout(Some(Duration::from_millis(10)))
+        .unwrap();
     let shim_port = u16::from_le_bytes([b.desc[57], b.desc[58]]);
     let hello = wire_packet("guest", 0x3, 1, b"op5 sub3 loss");
-    udp.send_to(&hello, ("127.0.0.1", shim_port)).expect("loss hello");
+    udp.send_to(&hello, ("127.0.0.1", shim_port))
+        .expect("loss hello");
     b.pump.pump_for(Duration::from_millis(100));
     let mut buf = [0u8; 2048];
     while udp.recv_from(&mut buf).is_ok() {}
@@ -904,7 +953,9 @@ fn run_loss_mode() {
     );
     check(
         "retransmits ride the RTO cadence",
-        copies.windows(2).all(|w| w[1] - w[0] >= Duration::from_millis(45)),
+        copies
+            .windows(2)
+            .all(|w| w[1] - w[0] >= Duration::from_millis(45)),
         &format!(
             "gaps_ms={:?}",
             copies
@@ -918,7 +969,8 @@ fn run_loss_mode() {
     // emits on its 5 s timer or every 50 events, and an ack logs no payload, so feed it tiny
     // best-effort sends until a stats line carries the acked counter.
     let ack = wire_ack("guest", 1);
-    udp.send_to(&ack, ("127.0.0.1", shim_port)).expect("loss ack");
+    udp.send_to(&ack, ("127.0.0.1", shim_port))
+        .expect("loss ack");
     let mut acked = None;
     let end = Instant::now() + Duration::from_secs(8);
     while Instant::now() < end {
@@ -1045,7 +1097,11 @@ fn run_outage_mode() {
     );
     let mut net2: H = null_mut();
     let c2 = unsafe { (b.f.connect)(b.handle, desc2.as_ptr(), null_mut(), &mut net2) };
-    check("outage ConnectToNetwork returns promptly", c2 == 0 && !net2.is_null(), "");
+    check(
+        "outage ConnectToNetwork returns promptly",
+        c2 == 0 && !net2.is_null(),
+        "",
+    );
     let t0 = Instant::now();
     let lv = unsafe { (b.f.leave)(net2, null_mut()) };
     let leave_ms = t0.elapsed().as_millis();
@@ -1123,7 +1179,8 @@ fn main() {
         let leave: LeaveFn = std::mem::transmute(sym(dll, b"PartyNetworkLeaveNetwork\0"));
         let cleanup: CleanupFn = std::mem::transmute(sym(dll, b"PartyCleanup\0"));
         let start: StartFn = std::mem::transmute(sym(dll, b"PartyStartProcessingStateChanges\0"));
-        let finish: FinishFn = std::mem::transmute(sym(dll, b"PartyFinishProcessingStateChanges\0"));
+        let finish: FinishFn =
+            std::mem::transmute(sym(dll, b"PartyFinishProcessingStateChanges\0"));
 
         let mut handle: H = null_mut();
         check(
@@ -1169,7 +1226,8 @@ fn main() {
         let mut local_ep: H = null_mut();
         check(
             "CreateEndpoint",
-            mk_ep(net, user, 0, null(), null(), null_mut(), &mut local_ep) == 0 && !local_ep.is_null(),
+            mk_ep(net, user, 0, null(), null(), null_mut(), &mut local_ep) == 0
+                && !local_ep.is_null(),
             "",
         );
 
@@ -1210,22 +1268,45 @@ fn main() {
         );
         if !got_guest {
             println!("DEBUG broker GET reqs:");
-            for r in broker.reqs.lock().unwrap().iter().filter(|r| r.path.starts_with("/party/peers")) {
+            for r in broker
+                .reqs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.path.starts_with("/party/peers"))
+            {
                 println!("DEBUG   {} {}", r.method, r.path);
             }
             println!("DEBUG shim log lines of interest:");
-            for l in log_text().lines().filter(|l| {
-                l.contains("guest") || l.contains("ensure_remote") || l.contains("EndpointCreated")
-                    || l.contains("party register") || l.contains("poll")
-            }).take(60) {
+            for l in log_text()
+                .lines()
+                .filter(|l| {
+                    l.contains("guest")
+                        || l.contains("ensure_remote")
+                        || l.contains("EndpointCreated")
+                        || l.contains("party register")
+                        || l.contains("poll")
+                })
+                .take(60)
+            {
                 println!("DEBUG LOG {l}");
             }
-            println!("DEBUG types={:?} remote_eps={:?}", pump.types_seen, pump.remote_eps.len());
+            println!(
+                "DEBUG types={:?} remote_eps={:?}",
+                pump.types_seen,
+                pump.remote_eps.len()
+            );
         }
         check(
             "delayed /party/peers result becomes a remote endpoint on the tick",
             got_guest,
-            &format!("remote_eps={:?}", pump.remote_eps.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>()),
+            &format!(
+                "remote_eps={:?}",
+                pump.remote_eps
+                    .iter()
+                    .map(|(e, _)| e.clone())
+                    .collect::<Vec<_>>()
+            ),
         );
         check(
             "tick never blocks on broker HTTP (700ms delays)",
@@ -1247,13 +1328,20 @@ fn main() {
         let udp = UdpSocket::bind("127.0.0.1:0").expect("test udp bind");
         udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         let shim_port = u16::from_le_bytes([desc[57], desc[58]]);
-        check("descriptor carries the UDP port", shim_port != 0, &format!("port={shim_port}"));
+        check(
+            "descriptor carries the UDP port",
+            shim_port != 0,
+            &format!("port={shim_port}"),
+        );
         let pkt = wire_packet("guest", 0x3, 1, b"op5 sub3 fastpath");
-        udp.send_to(&pkt, ("127.0.0.1", shim_port)).expect("send datagram");
-        udp.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        udp.send_to(&pkt, ("127.0.0.1", shim_port))
+            .expect("send datagram");
+        udp.set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
         let mut rbuf = [0u8; 512];
-        let mut ack: Result<(usize, std::net::SocketAddr), std::io::Error> =
-            Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "not yet"));
+        let mut ack: Result<(usize, std::net::SocketAddr), std::io::Error> = Err(
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "not yet"),
+        );
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             // Keep the tick running while we wait; the transport thread receives the datagram
@@ -1324,7 +1412,8 @@ fn main() {
             &format!("max_send={}us", max_send.as_micros()),
         );
         // Drain the datagrams the transport thread sent to our endpoint (now 127.0.0.1:our port).
-        udp.set_read_timeout(Some(Duration::from_millis(2))).unwrap();
+        udp.set_read_timeout(Some(Duration::from_millis(2)))
+            .unwrap();
         let mut drained = 0u32;
         while udp.recv_from(&mut rbuf).is_ok() {
             drained += 1;
@@ -1336,7 +1425,10 @@ fn main() {
             },
             Duration::from_secs(8),
         );
-        let jobs = hb.as_deref().and_then(|l| field_u64(l, "jobs")).unwrap_or(0);
+        let jobs = hb
+            .as_deref()
+            .and_then(|l| field_u64(l, "jobs"))
+            .unwrap_or(0);
         let hwm = hb
             .as_deref()
             .and_then(|l| field_u64(l, "outbox_hwm"))
@@ -1412,7 +1504,10 @@ fn main() {
             fresh && !stale_seen,
             &format!(
                 "remote_eps={:?}",
-                pump.remote_eps.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>()
+                pump.remote_eps
+                    .iter()
+                    .map(|(e, _)| e.clone())
+                    .collect::<Vec<_>>()
             ),
         );
         let leave_req = broker.wait_req(

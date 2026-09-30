@@ -15,7 +15,11 @@ fn main() {
     let dll = std::env::args_os()
         .nth(1)
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap().join("PlayFabMultiplayerWin.dll"));
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap()
+                .join("PlayFabMultiplayerWin.dll")
+        });
     let wide: Vec<u16> = dll
         .to_string_lossy()
         .encode_utf16()

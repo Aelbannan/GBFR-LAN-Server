@@ -167,7 +167,6 @@ impl MockBroker {
     fn fail_path(&self, path: Option<&str>) {
         self.state.lock().unwrap().fail_path = path.map(|s| s.to_string());
     }
-
 }
 
 fn header_end(buf: &[u8]) -> Option<usize> {
@@ -325,7 +324,8 @@ fn handle_mock(stream: &mut TcpStream, state: &Arc<Mutex<MockState>>) -> std::io
     if path.contains("CreateAndJoinLobby") || path.contains("UpdateLobby") {
         let mut g = state.lock().unwrap();
         if let Some(ld) = object_of(&_body, "LobbyData") {
-            let fresh: std::collections::HashMap<String, String> = parse_pairs(ld).into_iter().collect();
+            let fresh: std::collections::HashMap<String, String> =
+                parse_pairs(ld).into_iter().collect();
             if path.contains("CreateAndJoinLobby") {
                 g.lobby_data = fresh;
             } else {
@@ -333,7 +333,8 @@ fn handle_mock(stream: &mut TcpStream, state: &Arc<Mutex<MockState>>) -> std::io
             }
         }
         if let Some(sd) = object_of(&_body, "SearchData") {
-            let fresh: std::collections::HashMap<String, String> = parse_pairs(sd).into_iter().collect();
+            let fresh: std::collections::HashMap<String, String> =
+                parse_pairs(sd).into_iter().collect();
             if path.contains("CreateAndJoinLobby") {
                 g.search_data = fresh;
             } else {
@@ -382,7 +383,8 @@ fn handle_mock(stream: &mut TcpStream, state: &Arc<Mutex<MockState>>) -> std::io
     let body = if path.contains("CreateAndJoinLobby") {
         "{\"code\":200,\"data\":{\"LobbyId\":\"lan-test\",\"ConnectionString\":\"lan.1AC1AD.lan-test\",\"MaxPlayers\":4},\"status\":\"OK\"}".to_string()
     } else if path.contains("JoinLobby") {
-        "{\"code\":200,\"data\":{\"LobbyId\":\"lan-test\",\"MaxPlayers\":4},\"status\":\"OK\"}".to_string()
+        "{\"code\":200,\"data\":{\"LobbyId\":\"lan-test\",\"MaxPlayers\":4},\"status\":\"OK\"}"
+            .to_string()
     } else if path.contains("GetLobby") {
         format!("{{\"code\":200,\"data\":{lobby_json},\"status\":\"OK\"}}")
     } else if path.contains("FindLobbies") {
@@ -433,7 +435,8 @@ struct Shim {
         *mut *mut c_void,
     ) -> i32,
     find: extern "system" fn(*mut c_void, *const EntityKey, *const c_void, *mut c_void) -> i32,
-    post: extern "system" fn(*mut c_void, *const EntityKey, *const u8, *const u8, *mut c_void) -> i32,
+    post:
+        extern "system" fn(*mut c_void, *const EntityKey, *const u8, *const u8, *mut c_void) -> i32,
     leave: extern "system" fn(*mut c_void, *const EntityKey, *mut c_void) -> i32,
     start: extern "system" fn(*mut c_void, *mut u32, *mut *mut *mut u8) -> i32,
     finish: extern "system" fn(*mut c_void, u32, *mut *mut u8) -> i32,
@@ -593,7 +596,10 @@ fn main() {
     std::env::set_var("GBFR_LAN_DEBUG", "0");
     let lib = load_shim(&dll.to_string_lossy());
     let mut shim = Shim::new(lib);
-    check!(shim.init("async-test") == 0 && !shim.handle.is_null(), "PFMultiplayerInitialize");
+    check!(
+        shim.init("async-test") == 0 && !shim.handle.is_null(),
+        "PFMultiplayerInitialize"
+    );
     check!(shim.set_token("player-1") == 0, "SetEntityToken");
 
     let creator = EntityKey {
@@ -627,7 +633,10 @@ fn main() {
             &mut lobby,
         );
         let dt = t0.elapsed();
-        check!(rc == 0 && !lobby.is_null(), "create returned S_OK + handle (rc=0x{rc:08X})");
+        check!(
+            rc == 0 && !lobby.is_null(),
+            "create returned S_OK + handle (rc=0x{rc:08X})"
+        );
         check!(
             dt < Duration::from_millis(150),
             "create returned in {dt:?} while the broker sleeps 400 ms (async)"
@@ -657,7 +666,10 @@ fn main() {
         let done = last_of(&log, 0).unwrap();
         check!(done.result == 0, "create completion result = 0");
         let mut lock = -1i32;
-        check!((shim.get_lock)(lobby, &mut lock) == 0, "membership lock readable after completion");
+        check!(
+            (shim.get_lock)(lobby, &mut lock) == 0,
+            "membership lock readable after completion"
+        );
         let mut owner: *const EntityKey = ptr::null();
         check!(
             (shim.get_owner)(lobby, &mut owner) == 0 && !owner.is_null(),
@@ -706,8 +718,14 @@ fn main() {
             &mut lobby,
         );
         let dt = t0.elapsed();
-        check!(rc == 0 && !lobby.is_null(), "join returned S_OK + handle (rc=0x{rc:08X})");
-        check!(dt < Duration::from_millis(150), "join returned in {dt:?} (async)");
+        check!(
+            rc == 0 && !lobby.is_null(),
+            "join returned S_OK + handle (rc=0x{rc:08X})"
+        );
+        check!(
+            dt < Duration::from_millis(150),
+            "join returned in {dt:?} (async)"
+        );
 
         let mut log = Vec::new();
         shim.pump_until(&mut log, Duration::from_millis(700), |l| has_type(l, 1));
@@ -786,7 +804,11 @@ fn main() {
             "error completion arrives"
         );
         let err = last_of(&log2, 12).unwrap();
-        check!(err.result != 0, "service error delivered in completion result (0x{:08X})", err.result);
+        check!(
+            err.result != 0,
+            "service error delivered in completion result (0x{:08X})",
+            err.result
+        );
         check!(err.n == 0, "error completion carries 0 rows");
         broker.fail_path(None);
     }
@@ -808,7 +830,10 @@ fn main() {
             ptr::null_mut(),
             &mut lobby,
         );
-        check!(rc == 0 && !lobby.is_null(), "create for postupdate returned a handle");
+        check!(
+            rc == 0 && !lobby.is_null(),
+            "create for postupdate returned a handle"
+        );
         let mut log = Vec::new();
         check!(
             shim.pump_until(&mut log, Duration::from_millis(3000), |l| has_type(l, 0)),
@@ -840,7 +865,10 @@ fn main() {
             ptr::null_mut(),
         );
         check!(rc == 0, "postupdate returned S_OK (rc=0x{rc:08X})");
-        check!(t0.elapsed() < Duration::from_millis(100), "postupdate returned immediately");
+        check!(
+            t0.elapsed() < Duration::from_millis(100),
+            "postupdate returned immediately"
+        );
         // Local apply is synchronous, so the getter sees the write before the completion.
         let key = cs("post1");
         let mut val: *const i8 = ptr::null();
@@ -857,7 +885,10 @@ fn main() {
             last_of(&log2, 8).unwrap().result == 0,
             "postupdate completion result = 0"
         );
-        check!(has_type(&log2, 7), "Updated echo (type 7) follows the completion");
+        check!(
+            has_type(&log2, 7),
+            "Updated echo (type 7) follows the completion"
+        );
 
         // Leave completes asynchronously too.
         let rc = (shim.leave)(lobby, &creator, ptr::null_mut());
@@ -887,15 +918,25 @@ fn main() {
             ptr::null_mut(),
             &mut lobby,
         );
-        check!(rc == 0, "create against a 500 still returns S_OK (rc=0x{rc:08X})");
-        check!(t0.elapsed() < Duration::from_millis(150), "create error path is async");
+        check!(
+            rc == 0,
+            "create against a 500 still returns S_OK (rc=0x{rc:08X})"
+        );
+        check!(
+            t0.elapsed() < Duration::from_millis(150),
+            "create error path is async"
+        );
         let mut log = Vec::new();
         check!(
             shim.pump_until(&mut log, Duration::from_millis(3000), |l| has_type(l, 0)),
             "CreateAndJoinLobbyCompleted (type 0) delivers the failure"
         );
         let done = last_of(&log, 0).unwrap();
-        check!(done.result != 0, "create completion carries the service error (0x{:08X})", done.result);
+        check!(
+            done.result != 0,
+            "create completion carries the service error (0x{:08X})",
+            done.result
+        );
         check!(!has_type(&log, 2), "failed create emits no MemberAdded");
         broker.fail_path(None);
     }
@@ -917,10 +958,19 @@ fn main() {
             &mut lobby,
         );
         check!(rc == 0, "stale create accepted");
-        check!((shim.uninit)(shim.handle) == 0, "Uninitialize with a job in flight");
+        check!(
+            (shim.uninit)(shim.handle) == 0,
+            "Uninitialize with a job in flight"
+        );
         let mut stale = Vec::new();
-        check!(shim.init("async-test-2") == 0 && !shim.handle.is_null(), "re-initialize");
-        check!(shim.set_token("player-3") == 0, "SetEntityToken after re-init");
+        check!(
+            shim.init("async-test-2") == 0 && !shim.handle.is_null(),
+            "re-initialize"
+        );
+        check!(
+            shim.set_token("player-3") == 0,
+            "SetEntityToken after re-init"
+        );
         // Wait past the broker delay: the old job finishes and must be dropped.
         shim.pump_until(&mut stale, Duration::from_millis(1500), |_| false);
         check!(

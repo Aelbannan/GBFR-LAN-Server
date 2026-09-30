@@ -68,11 +68,23 @@ fn schedule(
     if drop_mod != 0 && rng.next() % drop_mod == 0 {
         return;
     }
-    let jitter = if jitter_ms == 0 { 0 } else { rng.next() % (jitter_ms + 1) };
-    map.entry(now + jitter).or_default().push((seq, pay.clone()));
+    let jitter = if jitter_ms == 0 {
+        0
+    } else {
+        rng.next() % (jitter_ms + 1)
+    };
+    map.entry(now + jitter)
+        .or_default()
+        .push((seq, pay.clone()));
     if dup_mod != 0 && rng.next() % dup_mod == 0 {
-        let jitter2 = if jitter_ms == 0 { 0 } else { rng.next() % (jitter_ms + 1) };
-        map.entry(now + jitter + jitter2).or_default().push((seq, pay));
+        let jitter2 = if jitter_ms == 0 {
+            0
+        } else {
+            rng.next() % (jitter_ms + 1)
+        };
+        map.entry(now + jitter + jitter2)
+            .or_default()
+            .push((seq, pay));
     }
 }
 
@@ -118,14 +130,7 @@ fn simulate(
             }
             retransmits += 1;
             schedule(
-                &mut a2b,
-                &mut rng,
-                now,
-                r.seq,
-                r.payload,
-                drop_mod,
-                dup_mod,
-                jitter_ms,
+                &mut a2b, &mut rng, now, r.seq, r.payload, drop_mod, dup_mod, jitter_ms,
             );
         }
 
@@ -150,7 +155,11 @@ fn simulate(
                     // gets no return packet, exercising the forced standalone ack.
                     if seq % 5 != 0 {
                         let ack = rx.piggyback_ack();
-                        let jitter = if jitter_ms == 0 { 0 } else { rng.next() % (jitter_ms + 1) };
+                        let jitter = if jitter_ms == 0 {
+                            0
+                        } else {
+                            rng.next() % (jitter_ms + 1)
+                        };
                         b2a.entry(t + jitter).or_default().push(ack);
                     }
                 }
@@ -158,7 +167,11 @@ fn simulate(
         }
 
         if let Some(ack) = rx.forced_ack(now) {
-            let jitter = if jitter_ms == 0 { 0 } else { rng.next() % (jitter_ms + 1) };
+            let jitter = if jitter_ms == 0 {
+                0
+            } else {
+                rng.next() % (jitter_ms + 1)
+            };
             b2a.entry(now + jitter).or_default().push(ack);
         }
 
@@ -312,7 +325,11 @@ fn simulate_timer_driven(
         if let Some(ack) = rx.forced_ack(now) {
             forced_acks += 1;
             ack_times.push(now);
-            let jitter = if jitter_ms == 0 { 0 } else { rng.next() % (jitter_ms + 1) };
+            let jitter = if jitter_ms == 0 {
+                0
+            } else {
+                rng.next() % (jitter_ms + 1)
+            };
             b2a.entry(now + jitter).or_default().push(ack);
         }
         while let Some((&t, _)) = b2a.first_key_value() {
@@ -332,13 +349,13 @@ fn simulate_timer_driven(
             return TimerSim {
                 delivered,
                 retransmits,
-                retransmits_after_last_send: retx_times.iter().filter(|t| **t > last_send_ms).count()
-                    as u32,
-                forced_acks,
-                forced_acks_after_last_send: ack_times
+                retransmits_after_last_send: retx_times
                     .iter()
                     .filter(|t| **t > last_send_ms)
                     .count() as u32,
+                forced_acks,
+                forced_acks_after_last_send: ack_times.iter().filter(|t| **t > last_send_ms).count()
+                    as u32,
                 send_calls,
                 last_send_ms,
                 converged: true,
@@ -351,12 +368,10 @@ fn simulate_timer_driven(
     TimerSim {
         delivered,
         retransmits,
-        retransmits_after_last_send: retx_times.iter().filter(|t| **t > last_send_ms).count() as u32,
+        retransmits_after_last_send: retx_times.iter().filter(|t| **t > last_send_ms).count()
+            as u32,
         forced_acks,
-        forced_acks_after_last_send: ack_times
-            .iter()
-            .filter(|t| **t > last_send_ms)
-            .count() as u32,
+        forced_acks_after_last_send: ack_times.iter().filter(|t| **t > last_send_ms).count() as u32,
         send_calls,
         last_send_ms,
         converged: false,
@@ -371,7 +386,14 @@ fn main() {
     );
 
     // 1. Guaranteed + Sequential over a link that drops, duplicates and reorders.
-    let r = simulate(0x1234_5678, 200, SEND_GUARANTEED | SEND_SEQUENTIAL, 4, 5, 17);
+    let r = simulate(
+        0x1234_5678,
+        200,
+        SEND_GUARANTEED | SEND_SEQUENTIAL,
+        4,
+        5,
+        17,
+    );
     let expected: Vec<Vec<u8>> = (0..200).map(payload).collect();
     check(
         "guar-seq converged",
@@ -387,7 +409,11 @@ fn main() {
     check(
         "guar-seq every message exactly once, in order",
         r.delivered == expected,
-        &format!("delivered={} expected={}", r.delivered.len(), expected.len()),
+        &format!(
+            "delivered={} expected={}",
+            r.delivered.len(),
+            expected.len()
+        ),
     );
     check(
         "guar-seq retransmission happened",
@@ -576,12 +602,7 @@ fn main() {
         let mut rx = Receiver::new();
         let mut evicted = None;
         for i in 2..(OOO_CAP as u32 + 5) {
-            rx.on_message(
-                i,
-                SEND_GUARANTEED | SEND_SEQUENTIAL,
-                payload(i),
-                0,
-            );
+            rx.on_message(i, SEND_GUARANTEED | SEND_SEQUENTIAL, payload(i), 0);
             if rx.last_evicted.is_some() {
                 evicted = rx.last_evicted;
             }
@@ -625,7 +646,9 @@ fn main() {
         let mut clock = 0u64;
         let mut retx: Vec<(u64, u32)> = Vec::new();
         for _ in 0..3 {
-            clock = tx.next_rto_ms().expect("pending message has an RTO deadline");
+            clock = tx
+                .next_rto_ms()
+                .expect("pending message has an RTO deadline");
             for r in tx.due(clock) {
                 if !r.gave_up {
                     retx.push((clock, r.retries));

@@ -19,3 +19,6 @@ target/
 # Editor / OS noise
 .DS_Store
 Thumbs.db
+
+# Local scratch output (test logs, ad-hoc scripts)
+.scratch/

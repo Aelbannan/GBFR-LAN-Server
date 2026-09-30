@@ -103,8 +103,13 @@ fn main() {
             *mut c_void,
             *mut *mut c_void,
         ) -> i32 = std::mem::transmute(get("PFMultiplayerCreateAndJoinLobby"));
-        let post: extern "system" fn(*mut c_void, *const EntityKey, *const u8, *const u8, *mut c_void) -> i32 =
-            std::mem::transmute(get("PFLobbyPostUpdate"));
+        let post: extern "system" fn(
+            *mut c_void,
+            *const EntityKey,
+            *const u8,
+            *const u8,
+            *mut c_void,
+        ) -> i32 = std::mem::transmute(get("PFLobbyPostUpdate"));
         let get_lobby_prop: extern "system" fn(*mut c_void, *const i8, *mut *const i8) -> i32 =
             std::mem::transmute(get("PFLobbyGetLobbyProperty"));
         let get_search_prop: extern "system" fn(*mut c_void, *const i8, *mut *const i8) -> i32 =
@@ -118,14 +123,20 @@ fn main() {
 
         let mut handle: *mut c_void = ptr::null_mut();
         let title = cs("lan-postupdate-test");
-        check!(init(title.as_ptr(), &mut handle) == 0 && !handle.is_null(), "PFMultiplayerInitialize");
+        check!(
+            init(title.as_ptr(), &mut handle) == 0 && !handle.is_null(),
+            "PFMultiplayerInitialize"
+        );
 
         let creator = EntityKey {
             id: cs("E1").into_raw(),
             type_: cs("title_player_account").into_raw(),
         };
         let token = cs("STUB-TEST-TOKEN");
-        check!(set_token(handle, &creator, token.as_ptr()) == 0, "PFMultiplayerSetEntityToken");
+        check!(
+            set_token(handle, &creator, token.as_ptr()) == 0,
+            "PFMultiplayerSetEntityToken"
+        );
 
         // --- create with lobby + search data -------------------------------------------------
         let lk = [cs("comment1").into_raw(), cs("extra").into_raw()];
@@ -159,7 +170,10 @@ fn main() {
             ptr::null_mut(),
             &mut lobby,
         );
-        check!(rc == 0 && !lobby.is_null(), "PFMultiplayerCreateAndJoinLobby rc=0x{rc:08X}");
+        check!(
+            rc == 0 && !lobby.is_null(),
+            "PFMultiplayerCreateAndJoinLobby rc=0x{rc:08X}"
+        );
 
         // The broker work is async now, so completions must be pumped out of the state-change
         // queue instead of being assumed to be ready immediately after the call.
@@ -186,7 +200,10 @@ fn main() {
             println!("   (pumped {what}: seen={seen})");
             seen
         };
-        check!(pump(&[0], 3000, "create completion"), "create completed (type 0)");
+        check!(
+            pump(&[0], 3000, "create completion"),
+            "create completed (type 0)"
+        );
 
         let k_comment = cs("comment1");
         let k_extra = cs("extra");
@@ -265,14 +282,23 @@ fn main() {
             ptr::null(),
             ptr::null_mut(),
         );
-        check!(rc == 0, "PFLobbyPostUpdate(membershipLock=Locked) rc=0x{rc:08X}");
+        check!(
+            rc == 0,
+            "PFLobbyPostUpdate(membershipLock=Locked) rc=0x{rc:08X}"
+        );
         check!(
             pump(&[8], 3000, "post-update scalar completion"),
             "post-update scalar completed (type 8)"
         );
         let mut lock_val: i32 = -1;
-        check!(get_lock(lobby, &mut lock_val) == 0, "PFLobbyGetMembershipLock");
-        check!(lock_val == 1, "membershipLock scalar applied locally (got {lock_val})");
+        check!(
+            get_lock(lobby, &mut lock_val) == 0,
+            "PFLobbyGetMembershipLock"
+        );
+        check!(
+            lock_val == 1,
+            "membershipLock scalar applied locally (got {lock_val})"
+        );
 
         println!("\nALL EXPECTATIONS PASSED");
     }
