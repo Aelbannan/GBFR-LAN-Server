@@ -74,6 +74,15 @@ game crash.
 
 ## Install
 
+### Prebuilt beta
+
+CI publishes a rolling pre-release on the [Releases](../../releases) page whenever
+`main` builds green: the three DLLs, the broker, and a zip laid out exactly as the
+installer expects (plus SHA-256 checksums). Extract it and run
+`install.ps1 -SkipBuild -GameDir ...` from the extracted folder; the release notes
+list the commit and the asset-to-folder mapping.
+
+
 Close the game first. The installer builds everything and copies it into an existing
 game folder (`-GameDir` must contain `granblue_fantasy_relink.exe`):
 

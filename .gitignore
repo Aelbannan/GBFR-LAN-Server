@@ -22,3 +22,6 @@ Thumbs.db
 
 # Local scratch output (test logs, ad-hoc scripts)
 .scratch/
+
+# Release packaging output (release.yml)
+dist/

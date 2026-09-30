@@ -1,0 +1,189 @@
+name: Beta release
+
+# Builds the four components, runs the whole test suite, and publishes a rolling
+# "beta" pre-release with the DLLs, the broker and a ready-to-extract installer zip.
+#
+# The beta release is recreated on every run, so the `beta` tag and asset URLs always
+# point at the latest green build. The suite runs before packaging: a red suite stops
+# the release (this duplicates the test job in ci.yml for default-branch pushes on
+# purpose, so a release never depends on another workflow having passed).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+# gh release create/delete needs to write releases; everything else is read-only.
+permissions:
+  contents: write
+
+# Never cancel a run midway: the release is deleted and recreated, and a cancelled run
+# could leave it missing. Queued runs publish in order, newest last.
+concurrency:
+  group: beta-release
+  cancel-in-progress: false
+
+jobs:
+  beta:
+    name: Build, test, publish beta
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Builds all four components (cargo workspace) and runs every suite.
+      - name: Build and test
+        run: .\run_tests.ps1
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $short = $env:GITHUB_SHA.Substring(0, 7)
+          $date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'")
+          $root = "dist\package"
+
+          Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path `
+            "$root\steam-http-shim", "$root\party-shim", "$root\playfab-mp-shim", "$root\lan-server" | Out-Null
+
+          # Mirror the repo layout so the bundled install.ps1 / install_nucleus.ps1 work as-is
+          # with -SkipBuild after extracting the zip.
+          Copy-Item steam-http-shim\gbfr_http.dll            "$root\steam-http-shim\"
+          Copy-Item party-shim\PartyWin.dll                  "$root\party-shim\"
+          Copy-Item playfab-mp-shim\PlayFabMultiplayerWin.dll "$root\playfab-mp-shim\"
+          Copy-Item lan-server\gbfr-lan-server.exe           "$root\lan-server\"
+          Copy-Item lan.ini, lan.ini.example, install.ps1, install_nucleus.ps1, open_firewall.ps1 $root
+
+          $install = @'
+          GBFR LAN - beta package
+          =======================
+
+          Close the game first. From this folder:
+
+              powershell -ExecutionPolicy Bypass -File install.ps1 -SkipBuild -GameDir "C:\Path\To\Granblue Fantasy Relink"
+
+          That copies:
+
+              steam-http-shim\gbfr_http.dll              -> <game>\steam_settings\load_dlls\
+              party-shim\PartyWin.dll                    -> <game>\  (original backed up to PartyWin.dll.ms)
+              playfab-mp-shim\PlayFabMultiplayerWin.dll  -> <game>\  (original backed up to .ms)
+              lan-server\gbfr-lan-server.exe             -> <game>\  (host PC only)
+              lan.ini                                    -> <game>\  (existing file is left alone)
+
+          Nucleus Co-op:  powershell -ExecutionPolicy Bypass -File install_nucleus.ps1 -SkipBuild
+          Firewall:       run open_firewall.ps1 as Administrator on each PC.
+
+          Quick start: edit <game>\lan.ini ([server] host = the host PC's LAN IP), run
+          gbfr-lan-server.exe on the host, then launch the game on every PC.
+
+          Requires your own copy of the game and a Goldberg Steam emulator build that loads
+          steam_settings\load_dlls. LAN / offline use only. Not affiliated with Cygames.
+          '@
+          [IO.File]::WriteAllText("$PWD\$root\INSTALL-BETA.txt", $install)
+
+          Compress-Archive -Path "$root\*" -DestinationPath dist\gbfr-lan-beta.zip
+
+          # Loose copies for a manual install, plus checksums for everything attached.
+          Copy-Item steam-http-shim\gbfr_http.dll, party-shim\PartyWin.dll, playfab-mp-shim\PlayFabMultiplayerWin.dll, lan-server\gbfr-lan-server.exe dist\
+          Get-FileHash dist\gbfr-lan-beta.zip, dist\gbfr_http.dll, dist\PartyWin.dll, dist\PlayFabMultiplayerWin.dll, dist\gbfr-lan-server.exe -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
+            Set-Content dist\SHA256SUMS.txt -Encoding ascii
+
+          # Release notes. Single-quoted here-string: backticks are Markdown here, not escapes.
+          $notes = @'
+          # GBFR LAN beta
+
+          Automated beta build of the LAN co-op stack: the `steam-http-shim`, `party-shim` and
+          `playfab-mp-shim` DLLs plus the `gbfr-lan-server.exe` broker.
+
+          | | |
+          |---|---|
+          | Commit | `$SHA$` |
+          | Ref | `$REF$` |
+          | Built | $DATE$ |
+          | Test suite | all suites passed (`run_tests.ps1`) |
+          | Workflow run | $RUNURL$ |
+
+          ## Assets
+
+          | Asset | Purpose |
+          |---|---|
+          | `gbfr-lan-beta.zip` | everything below in the layout the installer expects |
+          | `gbfr_http.dll` | `<game>\steam_settings\load_dlls\` |
+          | `PartyWin.dll` | `<game>\` (replaces the shipping DLL; original kept as `.ms`) |
+          | `PlayFabMultiplayerWin.dll` | `<game>\` (same) |
+          | `gbfr-lan-server.exe` | `<game>\` (host PC only) |
+          | `SHA256SUMS.txt` | SHA-256 of the assets above |
+
+          ## Install
+
+          Extract `gbfr-lan-beta.zip` and, from the extracted folder:
+
+          ```powershell
+          powershell -ExecutionPolicy Bypass -File install.ps1 -SkipBuild -GameDir "C:\Path\To\Granblue Fantasy Relink"
+          ```
+
+          `-SkipBuild` uses the bundled binaries. For Nucleus Co-op run
+          `install_nucleus.ps1 -SkipBuild` instead. See the repository README for `lan.ini`,
+          firewall and troubleshooting details.
+
+          Requires your own copy of the game and a Goldberg Steam emulator build that loads
+          `steam_settings\load_dlls`. LAN / offline use only. Not affiliated with Cygames.
+          '@
+          $notes = $notes.Replace('$SHA$', $env:GITHUB_SHA).
+                          Replace('$REF$', $env:GITHUB_REF_NAME).
+                          Replace('$DATE$', $date).
+                          Replace('$RUNURL$', "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID")
+          $notes = ($notes -split "`n" | ForEach-Object { $_.TrimStart() }) -join "`n"
+          # WriteAllText: UTF-8 without a BOM, and the LF line endings survive on both
+          # Windows PowerShell and pwsh.
+          [IO.File]::WriteAllText("$PWD\dist\BETA-NOTES.md", $notes)
+
+          Write-Host "Packaged commit $short ($date)"
+          Get-ChildItem dist -File | ForEach-Object { Write-Host ("  {0}  {1} bytes" -f $_.Name, $_.Length) }
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gbfr-lan-beta-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            dist/gbfr-lan-beta.zip
+            dist/SHA256SUMS.txt
+
+      - name: Publish beta release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          $short = $env:GITHUB_SHA.Substring(0, 7)
+
+          foreach ($f in @("dist\gbfr-lan-beta.zip", "dist\SHA256SUMS.txt", "dist\gbfr_http.dll",
+                           "dist\PartyWin.dll", "dist\PlayFabMultiplayerWin.dll", "dist\gbfr-lan-server.exe")) {
+            if (-not (Test-Path $f)) { throw "missing release asset: $f" }
+          }
+
+          # Rolling beta: drop the previous release and its tag, then publish this build so the
+          # tag and every asset URL point at the commit that was just tested.
+          gh release delete beta --yes --cleanup-tag 2>$null
+          if ($LASTEXITCODE -ne 0) { Write-Host "no previous beta release" }
+
+          gh release create beta `
+            --prerelease `
+            --target $env:GITHUB_SHA `
+            --title "GBFR LAN beta $short" `
+            --notes-file dist\BETA-NOTES.md `
+            dist\gbfr-lan-beta.zip `
+            dist\SHA256SUMS.txt `
+            dist\gbfr_http.dll `
+            dist\PartyWin.dll `
+            dist\PlayFabMultiplayerWin.dll `
+            dist\gbfr-lan-server.exe
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed ($LASTEXITCODE)" }
+
+          Write-Host "Published pre-release 'beta' at $env:GITHUB_SHA"
+          gh release view beta --json url,name,isPrerelease,tagName,assets | Write-Host
