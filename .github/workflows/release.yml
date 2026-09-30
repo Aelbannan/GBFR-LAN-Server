@@ -31,7 +31,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # Pinned in rust-toolchain.toml; bump both together (see the comment there).
+          toolchain: 1.94.1
 
       # Builds all four components (cargo workspace) and runs every suite.
       - name: Build and test

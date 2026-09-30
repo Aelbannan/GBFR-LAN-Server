@@ -1,0 +1,11 @@
+# Pinned toolchain: local builds, CI and the released binaries all come from one compiler.
+#
+# Keep this version in step with the `toolchain:` inputs in .github/workflows/*.yml. Bumping it is
+# a deliberate change: a newer stable can add clippy lints, and the clippy gate runs with
+# `-D warnings`, so an unannounced bump would fail the release pipeline.
+#
+# The shims are cdylibs loaded into the game; building them with a known compiler is also what
+# makes a shipped `PartyWin.dll` reproducible from the commit it claims.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]

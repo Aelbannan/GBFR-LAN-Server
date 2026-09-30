@@ -4205,7 +4205,7 @@ fn sptr(v: Option<usize>) -> String {
     }
 }
 fn mix(h: &mut u64, v: Option<u64>) {
-    *h ^= v.map_or(u64::MAX, |x| x);
+    *h ^= v.unwrap_or(u64::MAX);
     *h = h.wrapping_mul(0x100_0000_01b3);
 }
 

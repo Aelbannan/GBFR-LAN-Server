@@ -231,16 +231,14 @@ impl Sender {
     /// Returns `(seq, options)` for each cleared message.
     pub fn on_ack(&mut self, ack: u32) -> Vec<(u32, u32)> {
         let mut cleared = Vec::new();
-        loop {
-            let Some((&k, _)) = self.pending.iter().next() else {
+        while let Some(&k) = self.pending.keys().next() {
+            if !seq_le(k, ack) {
                 break;
-            };
-            if seq_le(k, ack) {
-                if let Some(p) = self.pending.remove(&k) {
-                    cleared.push((k, p.options));
-                }
-            } else {
-                break;
+            }
+            match self.pending.remove(&k) {
+                Some(p) => cleared.push((k, p.options)),
+                // Unreachable while `k` comes from the same map, but never spin if it happens.
+                None => break,
             }
         }
         cleared
