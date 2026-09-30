@@ -1,8 +1,10 @@
-# Build LAN PartyWin.dll into this folder.
+# Build PartyWin.dll into this folder (cargo workspace build; see ../Cargo.toml).
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $here
-$env:BUILD_STAMP = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds().ToString()
-rustc --crate-type cdylib --edition 2021 src\lib.rs -o PartyWin.dll -C opt-level=2
+$root = Split-Path -Parent $here
+Set-Location $root
+$env:CARGO_TARGET_DIR = Join-Path $root "target"
+cargo build --release -p party-shim
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-Write-Host "Wrote $here\PartyWin.dll ($((Get-Item PartyWin.dll).Length) bytes)"
+Copy-Item -Force (Join-Path $env:CARGO_TARGET_DIR "release\PartyWin.dll") (Join-Path $here "PartyWin.dll")
+Write-Host "Wrote $here\PartyWin.dll ($((Get-Item (Join-Path $here 'PartyWin.dll')).Length) bytes)"

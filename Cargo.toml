@@ -1,0 +1,20 @@
+# Workspace for the GBFR LAN stack: one target dir, one lockfile, one `cargo` entry point for
+# build/fmt/clippy/test. `build.ps1` builds each member and copies the artifact into its
+# component folder.
+#
+# Panic strategy is deliberately the default (unwind):
+#   * the shim worker threads (Party transport/broker) recover with `catch_unwind` and fall back
+#     to the inline path, which `panic = "abort"` would turn into a game crash;
+#   * a panic that does cross a game-facing `extern "C"` export aborts regardless (Rust >= 1.71),
+#     so `abort` buys nothing there and removes the worker-thread fallback.
+[workspace]
+resolver = "2"
+members = [
+    "lan-server",
+    "party-shim",
+    "playfab-mp-shim",
+    "steam-http-shim",
+]
+
+[profile.release]
+opt-level = 2

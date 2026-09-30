@@ -1,8 +1,10 @@
-# Build gbfr_http.dll (ISteamHTTP WinHTTP shim) into this folder.
+# Build gbfr_http.dll into this folder (cargo workspace build; see ../Cargo.toml).
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $here
-$env:BUILD_STAMP = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds().ToString()
-rustc --crate-type cdylib --edition 2021 src\lib.rs -o gbfr_http.dll -C opt-level=2 -l winhttp
+$root = Split-Path -Parent $here
+Set-Location $root
+$env:CARGO_TARGET_DIR = Join-Path $root "target"
+cargo build --release -p steam-http-shim
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-Write-Host "Wrote $here\gbfr_http.dll"
+Copy-Item -Force (Join-Path $env:CARGO_TARGET_DIR "release\gbfr_http.dll") (Join-Path $here "gbfr_http.dll")
+Write-Host "Wrote $here\gbfr_http.dll ($((Get-Item (Join-Path $here 'gbfr_http.dll')).Length) bytes)"

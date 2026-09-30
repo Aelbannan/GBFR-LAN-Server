@@ -1,7 +1,10 @@
-# Build LAN PlayFabMultiplayerWin.dll into this folder.
+# Build PlayFabMultiplayerWin.dll into this folder (cargo workspace build; see ../Cargo.toml).
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $here
-rustc --crate-type cdylib --edition 2021 src\lib.rs -o PlayFabMultiplayerWin.dll -C opt-level=2
+$root = Split-Path -Parent $here
+Set-Location $root
+$env:CARGO_TARGET_DIR = Join-Path $root "target"
+cargo build --release -p playfab-mp-shim
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-Write-Host "Wrote $here\PlayFabMultiplayerWin.dll ($((Get-Item PlayFabMultiplayerWin.dll).Length) bytes)"
+Copy-Item -Force (Join-Path $env:CARGO_TARGET_DIR "release\PlayFabMultiplayerWin.dll") (Join-Path $here "PlayFabMultiplayerWin.dll")
+Write-Host "Wrote $here\PlayFabMultiplayerWin.dll ($((Get-Item (Join-Path $here 'PlayFabMultiplayerWin.dll')).Length) bytes)"
